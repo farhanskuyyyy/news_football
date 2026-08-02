@@ -42,6 +42,17 @@ make run     # starts postgres + redis containers, then go run .
 
 Note: local run uses `REDIS_ADDR=localhost:6379` from `.env` — needs a Redis reachable on the host (the compose Redis is not exposed to the host; adjust `.env` or add a port mapping if needed).
 
+## Ports
+
+Non-default host ports because the dev machine already uses the defaults (nginx on 8080, local Postgres on 5432, other Redis containers on 6379/6380):
+
+| Service            | Host port | Notes                                  |
+|--------------------|-----------|----------------------------------------|
+| App (Docker)       | 8082      | maps to 8080 in container              |
+| App (`make run`)   | 8090      | from `PORT` in `.env`                  |
+| Postgres (Docker)  | 5434      | `.env` `DB_PORT=5434` points here      |
+| Redis (Docker)     | not exposed | internal network only; local run uses host Redis on 6379 |
+
 ## Test
 
 ```bash
