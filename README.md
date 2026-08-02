@@ -60,9 +60,11 @@ make test    # go test -race
 make check   # vet + test + build (same as CI)
 ```
 
-## CI
+## CI/CD
 
-GitHub Actions (`.github/workflows/ci.yml`): vet + test + build on every push/PR to `main`, then Docker image build.
+GitHub Actions (`.github/workflows/ci.yml`): vet + test + build on every push/PR to `main`, then Docker image build, then SSH deploy to VPS (push to `main` only).
+
+Full server setup steps: see [DEPLOY.md](DEPLOY.md).
 
 ## Structure
 
