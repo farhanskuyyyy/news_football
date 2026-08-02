@@ -10,7 +10,17 @@ GET /news/:id  -> query Postgres by id
 GET /health    -> health check
 ```
 
-## Run with Docker
+## Quick start (Makefile)
+
+```bash
+make help    # list all commands
+make up      # build + start full stack (app + postgres + redis)
+make smoke   # test endpoints
+make logs    # tail app logs
+make down    # stop (data kept)
+```
+
+## Run with Docker (manual)
 
 ```bash
 cp .env.example .env   # set NEWS_API_KEY
@@ -26,18 +36,17 @@ curl http://localhost:8082/news/1
 
 ## Run locally
 
-Needs Postgres + Redis running (can use `docker compose up postgres redis`).
-
 ```bash
-cp .env.example .env
-export $(grep -v '^#' .env | xargs)
-go run .
+make run     # starts postgres + redis containers, then go run .
 ```
+
+Note: local run uses `REDIS_ADDR=localhost:6379` from `.env` — needs a Redis reachable on the host (the compose Redis is not exposed to the host; adjust `.env` or add a port mapping if needed).
 
 ## Test
 
 ```bash
-go test ./...
+make test    # go test -race
+make check   # vet + test + build (same as CI)
 ```
 
 ## CI

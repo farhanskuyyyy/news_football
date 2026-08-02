@@ -1,5 +1,6 @@
 .env
 *.exe
 server
+bin/
 /tmp/
 .DS_Store
