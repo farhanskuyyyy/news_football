@@ -192,15 +192,48 @@ Kalau job `deploy` merah di push pertama (sebelum secrets ada): buka run yang ga
 
 ## Nanti kalau mau HTTPS
 
-Ambil subdomain gratis di duckdns.org → point ke IP VPS, lalu:
+HTTPS butuh domain (Let's Encrypt nggak issue cert buat IP polos). Gratis pakai DuckDNS.
+
+### 1. Bikin subdomain di DuckDNS
+
+1. Buka [duckdns.org](https://www.duckdns.org), login (GitHub/Google)
+2. Kolom **sub domain**: ketik nama unik milikmu, misal `farhanapi` → klik **add domain**
+3. Di baris domain baru, kolom **current ip**: isi IP VPS → klik **update ip**
+
+> ⚠️ Di semua command bawah, `SUBDOMAINLU` = nama yang barusan kamu daftarkan.
+> Jangan dijalankan mentah-mentah pakai placeholder — subdomain milik orang lain
+> bakal bikin validasi certbot gagal (`Timeout during connect` ke IP yang bukan VPS-mu).
+
+### 2. Verifikasi DNS nunjuk ke VPS
+
+```bash
+dig +short SUBDOMAINLU.duckdns.org
+# output HARUS = IP VPS. Kalau kosong/beda, benerin dulu di duckdns, tunggu 1-2 menit.
+```
+
+### 3. Pasang cert
 
 ```bash
 sudo apt install -y certbot python3-certbot-nginx
-sudo sed -i 's/server_name _;/server_name NAMALU.duckdns.org;/' /etc/nginx/sites-available/apigo
+
+# ganti server_name di nginx (yang sekarang masih `_`)
+sudo sed -i 's/server_name .*;/server_name SUBDOMAINLU.duckdns.org;/' /etc/nginx/sites-available/apigo
 sudo nginx -t && sudo systemctl reload nginx
-sudo certbot --nginx -d NAMALU.duckdns.org
+
+# port 80 harus sudah ke-allow di ufw (dipakai validasi Let's Encrypt)
 sudo ufw allow 443/tcp
+sudo certbot --nginx -d SUBDOMAINLU.duckdns.org
 ```
+
+Certbot otomatis nambah `listen 443 ssl` + redirect 80→443 + auto-renewal.
+
+### 4. Tes
+
+```bash
+curl https://SUBDOMAINLU.duckdns.org/health
+```
+
+Gagal `Timeout during connect` = DNS belum nunjuk ke VPS (balik ke step 2) atau port 80 ketutup (`sudo ufw status`).
 
 ## Troubleshooting cepat
 
