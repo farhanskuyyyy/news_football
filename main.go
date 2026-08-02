@@ -29,7 +29,7 @@ func main() {
 	e.Use(middleware.Recover())
 
 	e.GET("/health", func(c echo.Context) error {
-		return c.JSON(http.StatusOK, echo.Map{"status": "ok"})
+		return c.JSON(http.StatusOK, echo.Map{"status": "ok bang"})
 	})
 	e.GET("/news", h.GetNews)
 	e.GET("/news/:id", h.GetNewsByID)
