@@ -22,7 +22,7 @@ func main() {
 
 	rdb := database.ConnectRedis(cfg)
 	client := services.NewNewsAPIClient(cfg.NewsAPIURL, cfg.NewsAPIKey)
-	h := handlers.NewNewsHandler(db, rdb, client)
+	h := handlers.NewNewsHandler(db, rdb, client, cfg.RefreshToken)
 
 	e := echo.New()
 	e.Use(middleware.Logger())
@@ -33,6 +33,7 @@ func main() {
 	})
 	e.GET("/news", h.GetNews)
 	e.GET("/news/:id", h.GetNewsByID)
+	e.POST("/news/refresh", h.RefreshNews)
 
 	e.Logger.Fatal(e.Start(":" + cfg.Port))
 }

@@ -23,10 +23,13 @@ type NewsHandler struct {
 	DB     *gorm.DB
 	Redis  *redis.Client
 	Client *services.NewsAPIClient
+	// RefreshToken, when non-empty, is required in the X-Refresh-Token
+	// header to call POST /news/refresh.
+	RefreshToken string
 }
 
-func NewNewsHandler(db *gorm.DB, rdb *redis.Client, client *services.NewsAPIClient) *NewsHandler {
-	return &NewsHandler{DB: db, Redis: rdb, Client: client}
+func NewNewsHandler(db *gorm.DB, rdb *redis.Client, client *services.NewsAPIClient, refreshToken string) *NewsHandler {
+	return &NewsHandler{DB: db, Redis: rdb, Client: client, RefreshToken: refreshToken}
 }
 
 // GetNews fetches articles from NewsAPI, upserts them into Postgres,
@@ -41,9 +44,36 @@ func (h *NewsHandler) GetNews(c echo.Context) error {
 		}
 	}
 
+	stored, err := h.refreshFromAPI(ctx)
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{"source": "db", "data": stored})
+}
+
+// RefreshNews forces a fetch from NewsAPI regardless of cache state,
+// upserts the articles, and rebuilds the Redis cache.
+func (h *NewsHandler) RefreshNews(c echo.Context) error {
+	if h.RefreshToken != "" && c.Request().Header.Get("X-Refresh-Token") != h.RefreshToken {
+		return echo.NewHTTPError(http.StatusUnauthorized, "invalid refresh token")
+	}
+
+	stored, err := h.refreshFromAPI(c.Request().Context())
+	if err != nil {
+		return err
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{"status": "refreshed", "count": len(stored)})
+}
+
+// refreshFromAPI fetches articles from NewsAPI, upserts them into Postgres,
+// rebuilds the Redis cache, and returns the stored list. Errors are already
+// echo.HTTPErrors and can be returned to the client as-is.
+func (h *NewsHandler) refreshFromAPI(ctx context.Context) ([]models.News, error) {
 	articles, err := h.Client.FetchArticles()
 	if err != nil {
-		return echo.NewHTTPError(http.StatusBadGateway, "failed to fetch from newsapi: "+err.Error())
+		return nil, echo.NewHTTPError(http.StatusBadGateway, "failed to fetch from newsapi: "+err.Error())
 	}
 
 	news := services.ArticlesToNews(articles)
@@ -52,17 +82,17 @@ func (h *NewsHandler) GetNews(c echo.Context) error {
 			Columns:   []clause.Column{{Name: "url"}},
 			DoNothing: true,
 		}).Create(&news).Error; err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, "failed to save news: "+err.Error())
+			return nil, echo.NewHTTPError(http.StatusInternalServerError, "failed to save news: "+err.Error())
 		}
 	}
 
 	var stored []models.News
 	if err := h.DB.Order("published_at DESC").Find(&stored).Error; err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, "failed to query news: "+err.Error())
+		return nil, echo.NewHTTPError(http.StatusInternalServerError, "failed to query news: "+err.Error())
 	}
 
 	h.cacheNews(ctx, stored)
-	return c.JSON(http.StatusOK, echo.Map{"source": "db", "data": stored})
+	return stored, nil
 }
 
 // GetNewsByID returns a single stored news row by its primary key.

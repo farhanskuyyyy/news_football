@@ -7,6 +7,8 @@ Simple news API for CI/CD RnD. Go + Echo + GORM + PostgreSQL + Redis.
 ```
 GET /news      -> fetch NewsAPI -> upsert to Postgres -> cache to Redis (5 min) -> return list
 GET /news/:id  -> query Postgres by id
+POST /news/refresh -> force fetch NewsAPI -> upsert -> rebuild Redis cache
+                  (optional: set REFRESH_TOKEN env; callers must send matching X-Refresh-Token header)
 GET /health    -> health check
 ```
 
