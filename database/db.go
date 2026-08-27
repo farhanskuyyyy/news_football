@@ -19,7 +19,14 @@ func ConnectPostgres(cfg *config.Config) (*gorm.DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := db.AutoMigrate(&models.News{}); err != nil {
+	if err := db.AutoMigrate(
+		&models.News{},
+		&models.Continent{},
+		&models.Country{},
+		&models.Region{},
+		&models.City{},
+		&models.Type{},
+	); err != nil {
 		return nil, err
 	}
 	return db, nil
