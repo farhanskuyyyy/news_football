@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,19 +29,37 @@ type SportmonksResponse struct {
 	Message      string          `json:"message,omitempty"`
 }
 
-// NewSportmonksClient initializes a new SportmonksClient instance.
+// NewSportmonksClient initializes a new SportmonksClient instance with a resilient HTTP transport.
 func NewSportmonksClient(baseURL, apiToken string) *SportmonksClient {
 	if baseURL == "" {
 		baseURL = "https://api.sportmonks.com/v3"
 	}
+
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
 	return &SportmonksClient{
-		BaseURL:    strings.TrimSuffix(baseURL, "/"),
-		APIToken:   apiToken,
-		HTTPClient: &http.Client{Timeout: 15 * time.Second},
+		BaseURL:  strings.TrimSuffix(baseURL, "/"),
+		APIToken: apiToken,
+		HTTPClient: &http.Client{
+			Transport: transport,
+			Timeout:   60 * time.Second, // Increased to 60s for heavy queries
+		},
 	}
 }
 
-// Get sends a GET request to any Sportmonks API v3 endpoint with optional query parameters.
+// Get sends a GET request to any Sportmonks API v3 endpoint with automatic retries on network/timeout errors.
 func (c *SportmonksClient) Get(endpoint string, queryParams map[string]string) ([]byte, error) {
 	endpoint = strings.TrimPrefix(endpoint, "/")
 
@@ -63,30 +83,76 @@ func (c *SportmonksClient) Get(endpoint string, queryParams map[string]string) (
 	}
 	reqURL.RawQuery = q.Encode()
 
-	req, err := http.NewRequest(http.MethodGet, reqURL.String(), nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
+	maxRetries := 5
+	var lastErr error
+	var lastBody []byte
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		req, err := http.NewRequest(http.MethodGet, reqURL.String(), nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		req.Header.Set("Accept", "application/json")
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := c.HTTPClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("http request failed: %w", err)
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt) * 2 * time.Second
+				log.Printf("[SportmonksClient] Network error on %s (%v), retrying in %v (attempt %d/%d)...", endpoint, err, backoff, attempt, maxRetries)
+				time.Sleep(backoff)
+				continue
+			}
+			return nil, lastErr
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("failed to read response body: %w", err)
+			if attempt < maxRetries {
+				time.Sleep(time.Duration(attempt) * time.Second)
+				continue
+			}
+			return nil, lastErr
+		}
+
+		lastBody = body
+
+		// Handle 429 Rate Limit (Sportmonks standard window resets per minute, so wait 15s, 30s, 45s, 60s)
+		if resp.StatusCode == http.StatusTooManyRequests {
+			lastErr = fmt.Errorf("sportmonks api error (status 429): %s", string(body))
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt*15) * time.Second
+				log.Printf("[SportmonksClient] Rate limited (429) on %s. Waiting %v before retry (attempt %d/%d)...", endpoint, backoff, attempt, maxRetries)
+				time.Sleep(backoff)
+				continue
+			}
+			return body, lastErr
+		}
+
+		// Handle 5xx Server Error
+		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+			lastErr = fmt.Errorf("sportmonks api error (status %d): %s", resp.StatusCode, string(body))
+			if attempt < maxRetries {
+				backoff := time.Duration(attempt*2) * time.Second
+				log.Printf("[SportmonksClient] Server error %d on %s, retrying in %v (attempt %d/%d)...", resp.StatusCode, endpoint, backoff, attempt, maxRetries)
+				time.Sleep(backoff)
+				continue
+			}
+			return body, lastErr
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return body, fmt.Errorf("sportmonks api error (status %d): %s", resp.StatusCode, string(body))
+		}
+
+		return body, nil
 	}
 
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("http request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read response body: %w", err)
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return body, fmt.Errorf("sportmonks api error (status %d): %s", resp.StatusCode, string(body))
-	}
-
-	return body, nil
+	return lastBody, lastErr
 }
 
 // helper for include param
@@ -338,6 +404,10 @@ func (c *SportmonksClient) GetNews(includes ...string) ([]byte, error) {
 
 func (c *SportmonksClient) GetPredictions(includes ...string) ([]byte, error) {
 	return c.Get("football/predictions/probabilities", buildParams(includes))
+}
+
+func (c *SportmonksClient) GetRivals(includes ...string) ([]byte, error) {
+	return c.Get("football/rivals", buildParams(includes))
 }
 
 // ==========================================

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"time"
 
 	"github.com/farhanarfianto/apigo-docker/models"
 	"gorm.io/gorm"
@@ -16,6 +17,7 @@ type PaginationInfo struct {
 	PerPage     int     `json:"per_page"`
 	CurrentPage int     `json:"current_page"`
 	NextPage    *string `json:"next_page"`
+	NextCursor  *string `json:"next_cursor"`
 	HasMore     bool    `json:"has_more"`
 }
 
@@ -86,162 +88,86 @@ func (s *CoreScraper) ScrapeAll() (*CoreScrapeResult, error) {
 	return result, nil
 }
 
-// ScrapeContinents fetches all pages of continents and upserts into Postgres DB.
+// scrapeCoreEntity is a generic helper to paginate any Core entity endpoint with cursor support.
+func scrapeCoreEntity[T any](client *SportmonksClient, db *gorm.DB, endpoint string) (int, error) {
+	var total int
+	page := 1
+	var cursor string
+
+	for {
+		params := make(map[string]string)
+
+		if cursor != "" {
+			// When cursor is used, Sportmonks strictly forbids "per_page" and "page"
+			params["cursor"] = cursor
+		} else {
+			params["page"] = strconv.Itoa(page)
+			params["per_page"] = strconv.Itoa(perPage)
+		}
+
+		raw, err := client.Get(endpoint, params)
+		if err != nil {
+			return total, fmt.Errorf("failed to fetch %s (page %d, cursor %s): %w", endpoint, page, cursor, err)
+		}
+
+		var envelope CoreResponseEnvelope[T]
+		if err := json.Unmarshal(raw, &envelope); err != nil {
+			return total, fmt.Errorf("failed to parse %s json: %w", endpoint, err)
+		}
+
+		if len(envelope.Data) > 0 {
+			if err := db.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&envelope.Data, dbBatchSize).Error; err != nil {
+				return total, fmt.Errorf("failed to save %s (page %d): %w", endpoint, page, err)
+			}
+			total += len(envelope.Data)
+		}
+
+		if envelope.Pagination == nil || !envelope.Pagination.HasMore {
+			break
+		}
+
+		nextCursor := ""
+		if envelope.Pagination.NextCursor != nil && *envelope.Pagination.NextCursor != "" {
+			nextCursor = extractCursor(*envelope.Pagination.NextCursor)
+		} else if envelope.Pagination.NextPage != nil && *envelope.Pagination.NextPage != "" {
+			nextCursor = extractCursor(*envelope.Pagination.NextPage)
+		}
+
+		if nextCursor != "" {
+			cursor = nextCursor
+		} else {
+			page++
+		}
+
+		// Rate limit: ~3 req/sec
+		time.Sleep(350 * time.Millisecond)
+	}
+
+	log.Printf("[CoreScraper] %s: fetched %d records", endpoint, total)
+	return total, nil
+}
+
+// ScrapeContinents fetches all pages of continents and upserts into DB.
 func (s *CoreScraper) ScrapeContinents() (int, error) {
-	var total int
-	page := 1
-
-	for {
-		raw, err := s.Client.Get("core/continents", map[string]string{"page": strconv.Itoa(page)})
-		if err != nil {
-			return total, fmt.Errorf("failed to fetch continents page %d: %w", page, err)
-		}
-
-		var envelope CoreResponseEnvelope[models.Continent]
-		if err := json.Unmarshal(raw, &envelope); err != nil {
-			return total, fmt.Errorf("failed to parse continents json: %w", err)
-		}
-
-		if len(envelope.Data) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(&envelope.Data).Error; err != nil {
-				return total, fmt.Errorf("failed to save continents page %d: %w", page, err)
-			}
-			total += len(envelope.Data)
-		}
-
-		if envelope.Pagination == nil || !envelope.Pagination.HasMore {
-			break
-		}
-		page++
-	}
-
-	return total, nil
+	return scrapeCoreEntity[models.Continent](s.Client, s.DB, "core/continents")
 }
 
-// ScrapeCountries fetches all pages of countries and upserts into Postgres DB.
+// ScrapeCountries fetches all pages of countries and upserts into DB.
 func (s *CoreScraper) ScrapeCountries() (int, error) {
-	var total int
-	page := 1
-
-	for {
-		raw, err := s.Client.Get("core/countries", map[string]string{"page": strconv.Itoa(page)})
-		if err != nil {
-			return total, fmt.Errorf("failed to fetch countries page %d: %w", page, err)
-		}
-
-		var envelope CoreResponseEnvelope[models.Country]
-		if err := json.Unmarshal(raw, &envelope); err != nil {
-			return total, fmt.Errorf("failed to parse countries json: %w", err)
-		}
-
-		if len(envelope.Data) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(&envelope.Data).Error; err != nil {
-				return total, fmt.Errorf("failed to save countries page %d: %w", page, err)
-			}
-			total += len(envelope.Data)
-		}
-
-		if envelope.Pagination == nil || !envelope.Pagination.HasMore {
-			break
-		}
-		page++
-	}
-
-	return total, nil
+	return scrapeCoreEntity[models.Country](s.Client, s.DB, "core/countries")
 }
 
-// ScrapeRegions fetches all pages of regions and upserts into Postgres DB.
+// ScrapeRegions fetches all pages of regions and upserts into DB.
 func (s *CoreScraper) ScrapeRegions() (int, error) {
-	var total int
-	page := 1
-
-	for {
-		raw, err := s.Client.Get("core/regions", map[string]string{"page": strconv.Itoa(page)})
-		if err != nil {
-			return total, fmt.Errorf("failed to fetch regions page %d: %w", page, err)
-		}
-
-		var envelope CoreResponseEnvelope[models.Region]
-		if err := json.Unmarshal(raw, &envelope); err != nil {
-			return total, fmt.Errorf("failed to parse regions json: %w", err)
-		}
-
-		if len(envelope.Data) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(&envelope.Data).Error; err != nil {
-				return total, fmt.Errorf("failed to save regions page %d: %w", page, err)
-			}
-			total += len(envelope.Data)
-		}
-
-		if envelope.Pagination == nil || !envelope.Pagination.HasMore {
-			break
-		}
-		page++
-	}
-
-	return total, nil
+	return scrapeCoreEntity[models.Region](s.Client, s.DB, "core/regions")
 }
 
-// ScrapeCities fetches all pages of cities and upserts into Postgres DB.
+// ScrapeCities fetches all pages of cities and upserts into DB.
 func (s *CoreScraper) ScrapeCities() (int, error) {
-	var total int
-	page := 1
-
-	for {
-		raw, err := s.Client.Get("core/cities", map[string]string{"page": strconv.Itoa(page)})
-		if err != nil {
-			return total, fmt.Errorf("failed to fetch cities page %d: %w", page, err)
-		}
-
-		var envelope CoreResponseEnvelope[models.City]
-		if err := json.Unmarshal(raw, &envelope); err != nil {
-			return total, fmt.Errorf("failed to parse cities json: %w", err)
-		}
-
-		if len(envelope.Data) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(&envelope.Data).Error; err != nil {
-				return total, fmt.Errorf("failed to save cities page %d: %w", page, err)
-			}
-			total += len(envelope.Data)
-		}
-
-		if envelope.Pagination == nil || !envelope.Pagination.HasMore {
-			break
-		}
-		page++
-	}
-
-	return total, nil
+	return scrapeCoreEntity[models.City](s.Client, s.DB, "core/cities")
 }
 
-// ScrapeTypes fetches all pages of types and upserts into Postgres DB.
+// ScrapeTypes fetches all pages of types and upserts into DB.
 func (s *CoreScraper) ScrapeTypes() (int, error) {
-	var total int
-	page := 1
-
-	for {
-		raw, err := s.Client.Get("core/types", map[string]string{"page": strconv.Itoa(page)})
-		if err != nil {
-			return total, fmt.Errorf("failed to fetch types page %d: %w", page, err)
-		}
-
-		var envelope CoreResponseEnvelope[models.Type]
-		if err := json.Unmarshal(raw, &envelope); err != nil {
-			return total, fmt.Errorf("failed to parse types json: %w", err)
-		}
-
-		if len(envelope.Data) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).Create(&envelope.Data).Error; err != nil {
-				return total, fmt.Errorf("failed to save types page %d: %w", page, err)
-			}
-			total += len(envelope.Data)
-		}
-
-		if envelope.Pagination == nil || !envelope.Pagination.HasMore {
-			break
-		}
-		page++
-	}
-
-	return total, nil
+	return scrapeCoreEntity[models.Type](s.Client, s.DB, "core/types")
 }

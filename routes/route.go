@@ -41,8 +41,10 @@ func SetupRoutes(e *echo.Echo, h *handlers.NewsHandler, smh *handlers.Sportmonks
 		sm.GET("/odds/markets", smh.GetMarkets)
 		sm.GET("/my/usage", smh.GetMyUsage)
 
-		// Scraper endpoint for Core entities
+		// Scraper endpoints for Core, Leagues & Football entities
 		sm.POST("/scrape/core", smh.ScrapeCoreData)
+		sm.POST("/scrape/leagues", smh.ScrapeLeaguesData)
+		sm.POST("/scrape/football", smh.ScrapeFootballData)
 
 		// Dynamic proxy route covering ALL 168+ Sportmonks v3 endpoints
 		// e.g. GET /sportmonks/football/transfers/latest

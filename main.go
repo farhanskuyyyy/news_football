@@ -24,9 +24,10 @@ func main() {
 	client := services.NewNewsAPIClient(cfg.NewsAPIURL, cfg.NewsAPIKey)
 	smClient := services.NewSportmonksClient(cfg.SportmonksBaseURL, cfg.SportmonksAPIToken)
 	coreScraper := services.NewCoreScraper(db, smClient)
+	footballScraper := services.NewFootballScraper(db, smClient)
 
 	h := handlers.NewNewsHandler(db, rdb, client, cfg.RefreshToken)
-	smh := handlers.NewSportmonksHandler(smClient, coreScraper)
+	smh := handlers.NewSportmonksHandler(smClient, coreScraper, footballScraper)
 
 	e := echo.New()
 	e.Use(middleware.Logger())

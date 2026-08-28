@@ -8,14 +8,16 @@ import (
 )
 
 type SportmonksHandler struct {
-	Client  *services.SportmonksClient
-	Scraper *services.CoreScraper
+	Client          *services.SportmonksClient
+	Scraper         *services.CoreScraper
+	FootballScraper *services.FootballScraper
 }
 
-func NewSportmonksHandler(client *services.SportmonksClient, scraper *services.CoreScraper) *SportmonksHandler {
+func NewSportmonksHandler(client *services.SportmonksClient, scraper *services.CoreScraper, footballScraper *services.FootballScraper) *SportmonksHandler {
 	return &SportmonksHandler{
-		Client:  client,
-		Scraper: scraper,
+		Client:          client,
+		Scraper:         scraper,
+		FootballScraper: footballScraper,
 	}
 }
 
@@ -26,6 +28,40 @@ func (h *SportmonksHandler) ScrapeCoreData(c echo.Context) error {
 	}
 
 	result, err := h.Scraper.ScrapeAll()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"status":  "success",
+		"scraped": result,
+	})
+}
+
+// ScrapeLeaguesData triggers fetching and saving all Leagues into DB.
+func (h *SportmonksHandler) ScrapeLeaguesData(c echo.Context) error {
+	if h.FootballScraper == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
+	}
+
+	count, err := h.FootballScraper.ScrapeLeagues()
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"status":  "success",
+		"scraped": echo.Map{"leagues": count},
+	})
+}
+
+// ScrapeFootballData triggers fetching and saving all Football entities into DB.
+func (h *SportmonksHandler) ScrapeFootballData(c echo.Context) error {
+	if h.FootballScraper == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
+	}
+
+	result, err := h.FootballScraper.ScrapeAllFootball()
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
