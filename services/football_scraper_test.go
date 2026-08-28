@@ -36,16 +36,19 @@ func TestFootballScraper(t *testing.T) {
 		// Fixture sub-entities
 		&models.FixtureEvent{},
 		&models.FixtureLineup{},
+		&models.FixtureLineupDetail{},
 		&models.FixtureStatistic{},
 		&models.FixtureScore{},
 		&models.Commentary{},
 		&models.State{},
+		&models.StandingDetail{},
 		// Pivot / Join tables
 		&models.SeasonTeam{},
 		&models.PlayerSeason{},
 		&models.PlayerStatistic{},
 		&models.TeamRival{},
 		&models.FixtureReferee{},
+		&models.SyncTable{},
 	); err != nil {
 		t.Fatalf("failed to automigrate football models: %v", err)
 	}
@@ -87,6 +90,8 @@ func TestFootballScraper(t *testing.T) {
 			fmt.Fprintln(w, `{"data":[{"id":1,"sport_id":1,"team_id":53,"rival_id":54}],"pagination":{"has_more":false}}`)
 		case "/v3/football/transfers":
 			fmt.Fprintln(w, `{"data":[{"id":1,"sport_id":1,"player_id":14,"to_team_id":53,"completed":true}],"pagination":{"has_more":false}}`)
+		case "/v3/football/states":
+			fmt.Fprintln(w, `{"data":[{"id":1,"state":"FT","name":"Full-Time","short_name":"FT","developer_name":"FULL_TIME"}],"pagination":{"has_more":false}}`)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

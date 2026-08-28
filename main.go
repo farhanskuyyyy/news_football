@@ -28,13 +28,14 @@ func main() {
 
 	h := handlers.NewNewsHandler(db, rdb, client, cfg.RefreshToken)
 	smh := handlers.NewSportmonksHandler(smClient, coreScraper, footballScraper)
+	ph := handlers.NewPortalHandler(db)
 
 	e := echo.New()
 	e.Use(middleware.Logger())
 	e.Use(middleware.Recover())
 
 	// Register routes
-	routes.SetupRoutes(e, h, smh)
+	routes.SetupRoutes(e, h, smh, ph)
 
 	e.Logger.Fatal(e.Start(":" + cfg.Port))
 }

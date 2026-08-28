@@ -20,6 +20,26 @@ const perPage = 50
 // dbBatchSize is the number of records to upsert per DB transaction.
 const dbBatchSize = 200
 
+// Dynamic TTL Constants for Table Synchronization (saving Sportmonks rate limits & quota)
+const (
+	TTLFixtures   = 1 * time.Hour
+	TTLStandings  = 1 * time.Hour
+	TTLTopscorers = 1 * time.Hour
+	TTLTransfers  = 12 * time.Hour
+	TTLSquads     = 24 * time.Hour
+	TTLPlayers    = 24 * time.Hour
+	TTLRounds     = 24 * time.Hour
+	TTLStages     = 24 * time.Hour
+	TTLTeams      = 7 * 24 * time.Hour
+	TTLSeasons    = 7 * 24 * time.Hour
+	TTLVenues     = 30 * 24 * time.Hour
+	TTLCoaches    = 30 * 24 * time.Hour
+	TTLReferees   = 30 * 24 * time.Hour
+	TTLRivals     = 30 * 24 * time.Hour
+	TTLStates     = 30 * 24 * time.Hour
+	TTLLeagues    = 30 * 24 * time.Hour
+)
+
 type FootballResponseEnvelope[T any] struct {
 	Data       []T             `json:"data"`
 	Pagination *PaginationInfo `json:"pagination"`
@@ -42,6 +62,7 @@ type FootballScrapeResult struct {
 	Topscorers         int `json:"topscorers"`
 	Transfers          int `json:"transfers"`
 	Rivals             int `json:"rivals"`
+	States             int `json:"states"`
 }
 
 type FootballScraper struct {
@@ -54,6 +75,104 @@ func NewFootballScraper(db *gorm.DB, client *SportmonksClient) *FootballScraper 
 		DB:     db,
 		Client: client,
 	}
+}
+
+// ShouldSync checks if a table needs to be synchronized based on dynamic TTL.
+// Returns false (skips) if last synced within TTL and status was success.
+func (s *FootballScraper) ShouldSync(tableName string, defaultTTL time.Duration, force ...bool) bool {
+	if len(force) > 0 && force[0] {
+		return true
+	}
+
+	var syncRecord models.SyncTable
+	if err := s.DB.First(&syncRecord, "table_name = ?", tableName).Error; err != nil {
+		return true // Never synced before
+	}
+
+	ttl := defaultTTL
+	if syncRecord.IntervalSeconds > 0 {
+		ttl = time.Duration(syncRecord.IntervalSeconds) * time.Second
+	}
+
+	if time.Since(syncRecord.LatestSyncedAt) < ttl && syncRecord.Status == "success" {
+		log.Printf("[SyncTracker] SKIPPING '%s': last synced %v ago (TTL: %v)",
+			tableName, time.Since(syncRecord.LatestSyncedAt).Round(time.Second), ttl)
+		return false
+	}
+	return true
+}
+
+// MarkSynced records the sync execution in the sync_tables table.
+func (s *FootballScraper) MarkSynced(tableName string, recordCount int, defaultTTL time.Duration, syncErr error) {
+	status := "success"
+	errMsg := ""
+	if syncErr != nil {
+		status = "failed"
+		errMsg = syncErr.Error()
+	}
+
+	syncRecord := models.SyncTable{
+		TableName:       tableName,
+		LatestSyncedAt:  time.Now(),
+		IntervalSeconds: int(defaultTTL.Seconds()),
+		RecordsSynced:   recordCount,
+		Status:          status,
+		ErrorMessage:    errMsg,
+		UpdatedAt:       time.Now(),
+	}
+
+	_ = s.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "table_name"}},
+		DoUpdates: clause.AssignmentColumns([]string{"latest_synced_at", "interval_seconds", "records_synced", "status", "error_message", "updated_at"}),
+	}).Create(&syncRecord)
+}
+
+// GetCurrentSeasonIDs returns active/current season IDs for active leagues.
+// If specificSeasonID is provided, it targets only that season.
+func (s *FootballScraper) GetCurrentSeasonIDs(activeLeagueIDs map[uint]bool, specificSeasonID ...uint) map[uint]bool {
+	seasonIDMap := make(map[uint]bool)
+	if len(specificSeasonID) > 0 && specificSeasonID[0] > 0 {
+		seasonIDMap[specificSeasonID[0]] = true
+		return seasonIDMap
+	}
+
+	var seasons []models.Season
+	query := s.DB.Where("is_current = ?", true)
+	if len(activeLeagueIDs) > 0 {
+		var ids []uint
+		for id := range activeLeagueIDs {
+			ids = append(ids, id)
+		}
+		query = query.Where("league_id IN ?", ids)
+	}
+	query.Find(&seasons)
+
+	for _, sn := range seasons {
+		seasonIDMap[sn.ID] = true
+	}
+
+	// Fallback if is_current is not yet set in DB: pick latest season per active league
+	if len(seasonIDMap) == 0 {
+		var allSeasons []models.Season
+		q := s.DB
+		if len(activeLeagueIDs) > 0 {
+			var ids []uint
+			for id := range activeLeagueIDs {
+				ids = append(ids, id)
+			}
+			q = q.Where("league_id IN ?", ids)
+		}
+		q.Order("ending_at DESC, id DESC").Find(&allSeasons)
+		seenLeague := make(map[uint]bool)
+		for _, sn := range allSeasons {
+			if !seenLeague[sn.LeagueID] {
+				seenLeague[sn.LeagueID] = true
+				seasonIDMap[sn.ID] = true
+			}
+		}
+	}
+
+	return seasonIDMap
 }
 
 // extractCursor parses a cursor token if raw is a full URL.
@@ -73,18 +192,21 @@ func extractCursor(raw string) string {
 
 // ScrapeLeagues fetches all leagues from Sportmonks and populates the DB setting Status = true by default.
 func (s *FootballScraper) ScrapeLeagues() (int, error) {
-	return scrapePaginated(s.Client, s.DB, "football/leagues", nil, func(data []models.League) (int, error) {
+	count, err := scrapePaginated(s.Client, s.DB, "football/leagues", nil, func(data []models.League) (int, error) {
 		for i := range data {
 			data[i].Status = true
 		}
 		err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&data, dbBatchSize).Error
 		return len(data), err
 	})
+	s.MarkSynced("leagues", count, TTLLeagues, err)
+	return count, err
 }
 
 // ScrapeAllFootball orchestrates scraping across all football sub-entities and pivot tables.
-// You can easily comment/uncomment any line below to skip or run specific datasets.
-func (s *FootballScraper) ScrapeAllFootball() (*FootballScrapeResult, error) {
+// By default it only syncs tables whose TTL has expired, and strictly targets the CURRENT season.
+func (s *FootballScraper) ScrapeAllFootball(force ...bool) (*FootballScrapeResult, error) {
+	isForce := len(force) > 0 && force[0]
 	result := &FootballScrapeResult{}
 
 	// Query active leagues from DB (status = true AND active = true)
@@ -103,91 +225,154 @@ func (s *FootballScraper) ScrapeAllFootball() (*FootballScrapeResult, error) {
 	for _, l := range activeLeagues {
 		activeLeagueIDs[l.ID] = true
 	}
-	log.Printf("[FootballScraper] Scraping data for %d active leagues", len(activeLeagues))
+	log.Printf("[FootballScraper] Scraping data for %d active leagues (Force: %v)", len(activeLeagues), isForce)
 
 	var err error
 
-	// =========================================================================
-	// TINGGAL COMMENT / UNCOMMENT BAGIAN DI BAWAH INI UNTUK SKIP ATAU RUN
-	// =========================================================================
-
-	// 1. Seasons
-	if result.Seasons, err = s.ScrapeSeasons(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping seasons: %v", err)
+	// 1. Seasons (TTL: 7 days)
+	if s.ShouldSync("seasons", TTLSeasons, isForce) {
+		result.Seasons, err = s.ScrapeSeasons(activeLeagueIDs)
+		s.MarkSynced("seasons", result.Seasons, TTLSeasons, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping seasons: %v", err)
+		}
 	}
 
-	// 2. Stages
-	if result.Stages, err = s.ScrapeStages(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping stages: %v", err)
+	// Resolve Current Season IDs for downstream filtering
+	currentSeasonIDs := s.GetCurrentSeasonIDs(activeLeagueIDs)
+	log.Printf("[FootballScraper] Target current seasons: %d active seasons", len(currentSeasonIDs))
+
+	// 2. Stages (TTL: 24h, filtered by current seasons)
+	if s.ShouldSync("stages", TTLStages, isForce) {
+		result.Stages, err = s.ScrapeStages(activeLeagueIDs, currentSeasonIDs)
+		s.MarkSynced("stages", result.Stages, TTLStages, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping stages: %v", err)
+		}
 	}
 
-	// 3. Rounds
-	if result.Rounds, err = s.ScrapeRounds(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping rounds: %v", err)
+	// 3. Rounds (TTL: 24h, filtered by current seasons)
+	if s.ShouldSync("rounds", TTLRounds, isForce) {
+		result.Rounds, err = s.ScrapeRounds(activeLeagueIDs, currentSeasonIDs)
+		s.MarkSynced("rounds", result.Rounds, TTLRounds, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping rounds: %v", err)
+		}
 	}
 
-	// 4. Teams (Hanya fetch klub dari musim/liga yang aktif)
-	if result.Teams, err = s.ScrapeTeams(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping teams: %v", err)
+	// 4. Teams (TTL: 7 days, teams for current seasons)
+	if s.ShouldSync("teams", TTLTeams, isForce) {
+		result.Teams, err = s.ScrapeTeams(activeLeagueIDs, currentSeasonIDs)
+		s.MarkSynced("teams", result.Teams, TTLTeams, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping teams: %v", err)
+		}
 	}
 
-	// 5. Standings (Populates standings & distinct season_teams pivot)
-	if result.Standings, err = s.ScrapeStandings(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping standings: %v", err)
+	// 5. Standings (TTL: 1h, filtered by current seasons)
+	if s.ShouldSync("standings", TTLStandings, isForce) {
+		result.Standings, err = s.ScrapeStandings(activeLeagueIDs, currentSeasonIDs)
+		s.MarkSynced("standings", result.Standings, TTLStandings, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping standings: %v", err)
+		}
 	}
 
-	// 6. Squads & Players (Hanya fetch skuad & pemain spesifik per (season_id, team_id))
-	if result.Squads, err = s.ScrapeSquads(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping squads: %v", err)
+	// 6. Squads & Players (TTL: 24h, filtered by current seasons)
+	if s.ShouldSync("squads", TTLSquads, isForce) {
+		result.Squads, err = s.ScrapeSquads(activeLeagueIDs, currentSeasonIDs)
+		s.MarkSynced("squads", result.Squads, TTLSquads, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping squads: %v", err)
+		}
 	}
 
-	// 7. Players (Extended profile per klub aktif)
-	if result.Players, err = s.ScrapePlayers(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping players: %v", err)
+	// 7. Players (Extended profile per klub aktif, TTL: 24h)
+	if s.ShouldSync("players", TTLPlayers, isForce) {
+		result.Players, err = s.ScrapePlayers(activeLeagueIDs, currentSeasonIDs)
+		s.MarkSynced("players", result.Players, TTLPlayers, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping players: %v", err)
+		}
 	}
 
-	// 8. Fixtures (Populates fixtures, events, lineups, statistics, scores & fixture_referees)
-	if result.Fixtures, err = s.ScrapeFixtures(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping fixtures: %v", err)
+	// 8. Fixtures (TTL: 1h, filtered by current seasons)
+	if s.ShouldSync("fixtures", TTLFixtures, isForce) {
+		result.Fixtures, err = s.ScrapeFixtures(activeLeagueIDs, currentSeasonIDs)
+		s.MarkSynced("fixtures", result.Fixtures, TTLFixtures, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping fixtures: %v", err)
+		}
 	}
 
-	// 9. Venues
-	if result.Venues, err = s.ScrapeVenues(); err != nil {
-		log.Printf("[FootballScraper] Error scraping venues: %v", err)
+	// 9. Venues (TTL: 30 days)
+	if s.ShouldSync("venues", TTLVenues, isForce) {
+		result.Venues, err = s.ScrapeVenues()
+		s.MarkSynced("venues", result.Venues, TTLVenues, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping venues: %v", err)
+		}
 	}
 
-	// 10. Coaches
-	if result.Coaches, err = s.ScrapeCoaches(); err != nil {
-		log.Printf("[FootballScraper] Error scraping coaches: %v", err)
+	// 10. Coaches (TTL: 30 days)
+	if s.ShouldSync("coaches", TTLCoaches, isForce) {
+		result.Coaches, err = s.ScrapeCoaches()
+		s.MarkSynced("coaches", result.Coaches, TTLCoaches, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping coaches: %v", err)
+		}
 	}
 
-	// 11. Referees
-	if result.Referees, err = s.ScrapeReferees(); err != nil {
-		log.Printf("[FootballScraper] Error scraping referees: %v", err)
+	// 11. Referees (TTL: 30 days)
+	if s.ShouldSync("referees", TTLReferees, isForce) {
+		result.Referees, err = s.ScrapeReferees()
+		s.MarkSynced("referees", result.Referees, TTLReferees, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping referees: %v", err)
+		}
 	}
 
-	// 12. Topscorers
-	if result.Topscorers, err = s.ScrapeTopscorers(activeLeagueIDs); err != nil {
-		log.Printf("[FootballScraper] Error scraping topscorers: %v", err)
+	// 12. Topscorers (TTL: 1h, filtered by current seasons)
+	if s.ShouldSync("topscorers", TTLTopscorers, isForce) {
+		result.Topscorers, err = s.ScrapeTopscorers(activeLeagueIDs, currentSeasonIDs)
+		s.MarkSynced("topscorers", result.Topscorers, TTLTopscorers, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping topscorers: %v", err)
+		}
 	}
 
-	// 13. Rivals (Populates team_rivals pivot table)
-	if result.Rivals, err = s.ScrapeRivals(); err != nil {
-		log.Printf("[FootballScraper] Error scraping rivals: %v", err)
+	// 13. Rivals (TTL: 30 days)
+	if s.ShouldSync("rivals", TTLRivals, isForce) {
+		result.Rivals, err = s.ScrapeRivals()
+		s.MarkSynced("rivals", result.Rivals, TTLRivals, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping rivals: %v", err)
+		}
 	}
 
-	// 14. Transfers
-	if result.Transfers, err = s.ScrapeTransfers(); err != nil {
-		log.Printf("[FootballScraper] Error scraping transfers: %v", err)
+	// 14. Transfers (TTL: 12h)
+	if s.ShouldSync("transfers", TTLTransfers, isForce) {
+		result.Transfers, err = s.ScrapeTransfers()
+		s.MarkSynced("transfers", result.Transfers, TTLTransfers, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping transfers: %v", err)
+		}
 	}
 
-	// =========================================================================
+	// 15. States (TTL: 30 days)
+	if s.ShouldSync("states", TTLStates, isForce) {
+		result.States, err = s.ScrapeStates()
+		s.MarkSynced("states", result.States, TTLStates, err)
+		if err != nil {
+			log.Printf("[FootballScraper] Error scraping states: %v", err)
+		}
+	}
 
 	return result, nil
 }
 
 // -----------------------------------------------------------------------------
-// Individual Scraping Methods
+// Individual Scraping Methods (Supporting Current Season Filtering)
 // -----------------------------------------------------------------------------
 
 // ScrapeSeasons fetches seasons and filters them by active leagues.
@@ -207,14 +392,23 @@ func (s *FootballScraper) ScrapeSeasons(activeLeagueIDs map[uint]bool) (int, err
 	})
 }
 
-// ScrapeStages fetches stages and filters them by active leagues.
-func (s *FootballScraper) ScrapeStages(activeLeagueIDs map[uint]bool) (int, error) {
+// ScrapeStages fetches stages and filters them by active leagues & current seasons.
+func (s *FootballScraper) ScrapeStages(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) (int, error) {
+	var targetSeasons map[uint]bool
+	if len(currentSeasonIDs) > 0 {
+		targetSeasons = currentSeasonIDs[0]
+	}
+
 	return scrapePaginated(s.Client, s.DB, "football/stages", nil, func(data []models.Stage) (int, error) {
 		var filtered []models.Stage
 		for _, stage := range data {
-			if activeLeagueIDs == nil || activeLeagueIDs[stage.LeagueID] {
-				filtered = append(filtered, stage)
+			if activeLeagueIDs != nil && !activeLeagueIDs[stage.LeagueID] {
+				continue
 			}
+			if targetSeasons != nil && len(targetSeasons) > 0 && !targetSeasons[stage.SeasonID] {
+				continue
+			}
+			filtered = append(filtered, stage)
 		}
 		if len(filtered) == 0 {
 			return 0, nil
@@ -224,14 +418,23 @@ func (s *FootballScraper) ScrapeStages(activeLeagueIDs map[uint]bool) (int, erro
 	})
 }
 
-// ScrapeRounds fetches rounds and filters them by active leagues.
-func (s *FootballScraper) ScrapeRounds(activeLeagueIDs map[uint]bool) (int, error) {
+// ScrapeRounds fetches rounds and filters them by active leagues & current seasons.
+func (s *FootballScraper) ScrapeRounds(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) (int, error) {
+	var targetSeasons map[uint]bool
+	if len(currentSeasonIDs) > 0 {
+		targetSeasons = currentSeasonIDs[0]
+	}
+
 	return scrapePaginated(s.Client, s.DB, "football/rounds", nil, func(data []models.Round) (int, error) {
 		var filtered []models.Round
 		for _, round := range data {
-			if activeLeagueIDs == nil || activeLeagueIDs[round.LeagueID] {
-				filtered = append(filtered, round)
+			if activeLeagueIDs != nil && !activeLeagueIDs[round.LeagueID] {
+				continue
 			}
+			if targetSeasons != nil && len(targetSeasons) > 0 && !targetSeasons[round.SeasonID] {
+				continue
+			}
+			filtered = append(filtered, round)
 		}
 		if len(filtered) == 0 {
 			return 0, nil
@@ -241,11 +444,25 @@ func (s *FootballScraper) ScrapeRounds(activeLeagueIDs map[uint]bool) (int, erro
 	})
 }
 
-// ScrapeTeams fetches teams only for seasons belonging to active leagues (via football/teams/seasons/:seasonId).
-func (s *FootballScraper) ScrapeTeams(activeLeagueIDs map[uint]bool) (int, error) {
+// ScrapeTeams fetches teams only for current seasons belonging to active leagues (via football/teams/seasons/:seasonId).
+func (s *FootballScraper) ScrapeTeams(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) (int, error) {
+	var targetSeasons map[uint]bool
+	if len(currentSeasonIDs) > 0 {
+		targetSeasons = currentSeasonIDs[0]
+	} else {
+		targetSeasons = s.GetCurrentSeasonIDs(activeLeagueIDs)
+	}
+
+	var seasonIDs []uint
+	for id := range targetSeasons {
+		seasonIDs = append(seasonIDs, id)
+	}
+
 	var seasons []models.Season
 	query := s.DB
-	if len(activeLeagueIDs) > 0 {
+	if len(seasonIDs) > 0 {
+		query = query.Where("id IN ?", seasonIDs)
+	} else if len(activeLeagueIDs) > 0 {
 		var ids []uint
 		for id := range activeLeagueIDs {
 			ids = append(ids, id)
@@ -261,7 +478,7 @@ func (s *FootballScraper) ScrapeTeams(activeLeagueIDs map[uint]bool) (int, error
 		return 0, nil
 	}
 
-	log.Printf("[FootballScraper] Scraping teams for %d active seasons...", len(seasons))
+	log.Printf("[FootballScraper] Scraping teams for %d current/active seasons...", len(seasons))
 
 	var total int
 	for _, season := range seasons {
@@ -295,23 +512,30 @@ func (s *FootballScraper) ScrapeTeams(activeLeagueIDs map[uint]bool) (int, error
 	return total, nil
 }
 
-// getActiveSeasonTeams retrieves distinct (season_id, team_id) pairs for the active leagues.
-func (s *FootballScraper) getActiveSeasonTeams(activeLeagueIDs map[uint]bool) []models.SeasonTeam {
-	var activeSeasonIDs []uint
-	if len(activeLeagueIDs) > 0 {
+// getActiveSeasonTeams retrieves distinct (season_id, team_id) pairs for active leagues & current seasons.
+func (s *FootballScraper) getActiveSeasonTeams(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) []models.SeasonTeam {
+	var targetSeasonIDs []uint
+	if len(currentSeasonIDs) > 0 && len(currentSeasonIDs[0]) > 0 {
+		for id := range currentSeasonIDs[0] {
+			targetSeasonIDs = append(targetSeasonIDs, id)
+		}
+	} else if len(activeLeagueIDs) > 0 {
 		var leagueIDs []uint
 		for id := range activeLeagueIDs {
 			leagueIDs = append(leagueIDs, id)
 		}
-		s.DB.Model(&models.Season{}).Where("league_id IN ?", leagueIDs).Pluck("id", &activeSeasonIDs)
+		s.DB.Model(&models.Season{}).Where("league_id IN ? AND is_current = ?", leagueIDs, true).Pluck("id", &targetSeasonIDs)
+		if len(targetSeasonIDs) == 0 {
+			s.DB.Model(&models.Season{}).Where("league_id IN ?", leagueIDs).Pluck("id", &targetSeasonIDs)
+		}
 	}
 
 	var rawPairs []models.SeasonTeam
 
 	// 1. Check SeasonTeam table
 	query := s.DB.Model(&models.SeasonTeam{})
-	if len(activeSeasonIDs) > 0 {
-		query = query.Where("season_id IN ?", activeSeasonIDs)
+	if len(targetSeasonIDs) > 0 {
+		query = query.Where("season_id IN ?", targetSeasonIDs)
 	}
 	query.Select("DISTINCT season_id, team_id").Find(&rawPairs)
 
@@ -319,8 +543,8 @@ func (s *FootballScraper) getActiveSeasonTeams(activeLeagueIDs map[uint]bool) []
 	if len(rawPairs) == 0 {
 		var standings []models.Standing
 		stQuery := s.DB.Model(&models.Standing{})
-		if len(activeSeasonIDs) > 0 {
-			stQuery = stQuery.Where("season_id IN ?", activeSeasonIDs)
+		if len(targetSeasonIDs) > 0 {
+			stQuery = stQuery.Where("season_id IN ?", targetSeasonIDs)
 		}
 		stQuery.Select("DISTINCT season_id, participant_id").Find(&standings)
 		for _, st := range standings {
@@ -334,10 +558,10 @@ func (s *FootballScraper) getActiveSeasonTeams(activeLeagueIDs map[uint]bool) []
 	}
 
 	// 3. Fallback: pair active seasons with all existing teams
-	if len(rawPairs) == 0 && len(activeSeasonIDs) > 0 {
+	if len(rawPairs) == 0 && len(targetSeasonIDs) > 0 {
 		var teamIDs []uint
 		s.DB.Model(&models.Team{}).Pluck("id", &teamIDs)
-		for _, snID := range activeSeasonIDs {
+		for _, snID := range targetSeasonIDs {
 			for _, tmID := range teamIDs {
 				rawPairs = append(rawPairs, models.SeasonTeam{
 					SeasonID: snID,
@@ -368,8 +592,8 @@ type SquadWithPlayerPayload struct {
 }
 
 // ScrapeSquads fetches squads per distinct (season_id, team_id) and populates squads, players, and player_seasons.
-func (s *FootballScraper) ScrapeSquads(activeLeagueIDs map[uint]bool) (int, error) {
-	seasonTeams := s.getActiveSeasonTeams(activeLeagueIDs)
+func (s *FootballScraper) ScrapeSquads(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) (int, error) {
+	seasonTeams := s.getActiveSeasonTeams(activeLeagueIDs, currentSeasonIDs...)
 	if len(seasonTeams) == 0 {
 		log.Println("[FootballScraper] No active (season, team) pairs found to scrape squads for.")
 		return 0, nil
@@ -432,8 +656,8 @@ func (s *FootballScraper) ScrapeSquads(activeLeagueIDs map[uint]bool) (int, erro
 }
 
 // ScrapePlayers fetches extended player profiles for distinct teams in active leagues.
-func (s *FootballScraper) ScrapePlayers(activeLeagueIDs map[uint]bool) (int, error) {
-	seasonTeams := s.getActiveSeasonTeams(activeLeagueIDs)
+func (s *FootballScraper) ScrapePlayers(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) (int, error) {
+	seasonTeams := s.getActiveSeasonTeams(activeLeagueIDs, currentSeasonIDs...)
 	teamIDMap := make(map[uint]bool)
 	for _, st := range seasonTeams {
 		teamIDMap[st.TeamID] = true
@@ -470,14 +694,22 @@ func (s *FootballScraper) ScrapePlayers(activeLeagueIDs map[uint]bool) (int, err
 	return total, nil
 }
 
+// LineupWithDetailsPayload decodes a lineup with its nested player details/statistics.
+type LineupWithDetailsPayload struct {
+	models.FixtureLineup
+	Details       []models.FixtureLineupDetail `json:"details"`
+	LineupDetails []models.FixtureLineupDetail `json:"lineup_details"`
+	LineupDetail  []models.FixtureLineupDetail `json:"lineupDetail"`
+}
+
 // FixturePayload decodes a fixture along with its nested includes.
 type FixturePayload struct {
 	models.Fixture
-	Events     []models.FixtureEvent     `json:"events"`
-	Lineups    []models.FixtureLineup    `json:"lineups"`
-	Scores     []models.FixtureScore     `json:"scores"`
-	Statistics []models.FixtureStatistic `json:"statistics"`
-	Referees   []struct {
+	Events       []models.FixtureEvent      `json:"events"`
+	Lineups      []LineupWithDetailsPayload `json:"lineups"`
+	Scores       []models.FixtureScore      `json:"scores"`
+	Statistics   []models.FixtureStatistic  `json:"statistics"`
+	Referees     []struct {
 		ID        uint  `json:"id"`
 		RefereeID uint  `json:"referee_id"`
 		TypeID    *uint `json:"type_id"`
@@ -487,16 +719,22 @@ type FixturePayload struct {
 	} `json:"participants"`
 }
 
-// ScrapeFixtures fetches fixtures and nested sub-entities (events, lineups, statistics, scores, referees).
-func (s *FootballScraper) ScrapeFixtures(activeLeagueIDs map[uint]bool) (int, error) {
+// ScrapeFixtures fetches fixtures and nested sub-entities (events, lineups with details, statistics, scores, referees).
+func (s *FootballScraper) ScrapeFixtures(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) (int, error) {
+	var targetSeasons map[uint]bool
+	if len(currentSeasonIDs) > 0 {
+		targetSeasons = currentSeasonIDs[0]
+	}
+
 	extraParams := map[string]string{
-		"include": "events;lineups;scores;statistics;referees;participants",
+		"include": "events;lineups.details;scores;statistics;referees;participants",
 	}
 
 	return scrapePaginated(s.Client, s.DB, "football/fixtures", extraParams, func(data []FixturePayload) (int, error) {
 		var fixtures []models.Fixture
 		var events []models.FixtureEvent
 		var lineups []models.FixtureLineup
+		var lineupDetails []models.FixtureLineupDetail
 		var scores []models.FixtureScore
 		var stats []models.FixtureStatistic
 		var referees []models.FixtureReferee
@@ -504,6 +742,9 @@ func (s *FootballScraper) ScrapeFixtures(activeLeagueIDs map[uint]bool) (int, er
 
 		for _, item := range data {
 			if activeLeagueIDs != nil && !activeLeagueIDs[item.LeagueID] {
+				continue
+			}
+			if targetSeasons != nil && len(targetSeasons) > 0 && !targetSeasons[item.SeasonID] {
 				continue
 			}
 
@@ -514,8 +755,20 @@ func (s *FootballScraper) ScrapeFixtures(activeLeagueIDs map[uint]bool) (int, er
 				events = append(events, ev)
 			}
 			for _, lu := range item.Lineups {
-				lu.FixtureID = item.ID
-				lineups = append(lineups, lu)
+				lModel := lu.FixtureLineup
+				lModel.FixtureID = item.ID
+				lineups = append(lineups, lModel)
+
+				allDetails := append(lu.Details, lu.LineupDetails...)
+				allDetails = append(allDetails, lu.LineupDetail...)
+				for _, dt := range allDetails {
+					dt.FixtureID = item.ID
+					dt.LineupID = lModel.ID
+					if dt.PlayerID == 0 {
+						dt.PlayerID = lModel.PlayerID
+					}
+					lineupDetails = append(lineupDetails, dt)
+				}
 			}
 			for _, sc := range item.Scores {
 				sc.FixtureID = item.ID
@@ -561,6 +814,9 @@ func (s *FootballScraper) ScrapeFixtures(activeLeagueIDs map[uint]bool) (int, er
 		if len(lineups) > 0 {
 			_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&lineups, dbBatchSize)
 		}
+		if len(lineupDetails) > 0 {
+			_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&lineupDetails, dbBatchSize)
+		}
 		if len(scores) > 0 {
 			_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&scores, dbBatchSize)
 		}
@@ -602,25 +858,52 @@ func (s *FootballScraper) ScrapeReferees() (int, error) {
 	})
 }
 
-// ScrapeStandings fetches standings and populates standings & distinct season_teams pivot table.
-func (s *FootballScraper) ScrapeStandings(activeLeagueIDs map[uint]bool) (int, error) {
-	return scrapePaginated(s.Client, s.DB, "football/standings", nil, func(data []models.Standing) (int, error) {
+// StandingPayload decodes standings with nested details.
+type StandingPayload struct {
+	models.Standing
+	Details []models.StandingDetail `json:"details"`
+}
+
+// ScrapeStandings fetches standings with nested details and populates standings, standing_details & distinct season_teams pivot table.
+func (s *FootballScraper) ScrapeStandings(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) (int, error) {
+	var targetSeasons map[uint]bool
+	if len(currentSeasonIDs) > 0 {
+		targetSeasons = currentSeasonIDs[0]
+	}
+
+	extraParams := map[string]string{
+		"include": "details",
+	}
+	return scrapePaginated(s.Client, s.DB, "football/standings", extraParams, func(data []StandingPayload) (int, error) {
 		var filtered []models.Standing
+		var standingDetails []models.StandingDetail
 		seenPair := make(map[string]bool)
 		var seasonTeams []models.SeasonTeam
 
-		for _, standing := range data {
-			if activeLeagueIDs == nil || activeLeagueIDs[standing.LeagueID] {
-				filtered = append(filtered, standing)
-				if standing.SeasonID > 0 && standing.ParticipantID > 0 {
-					key := fmt.Sprintf("%d-%d", standing.SeasonID, standing.ParticipantID)
-					if !seenPair[key] {
-						seenPair[key] = true
-						seasonTeams = append(seasonTeams, models.SeasonTeam{
-							SeasonID: standing.SeasonID,
-							TeamID:   standing.ParticipantID,
-						})
-					}
+		for _, item := range data {
+			standing := item.Standing
+			if activeLeagueIDs != nil && !activeLeagueIDs[standing.LeagueID] {
+				continue
+			}
+			if targetSeasons != nil && len(targetSeasons) > 0 && !targetSeasons[standing.SeasonID] {
+				continue
+			}
+
+			filtered = append(filtered, standing)
+			for _, dt := range item.Details {
+				if dt.StandingID == 0 {
+					dt.StandingID = standing.ID
+				}
+				standingDetails = append(standingDetails, dt)
+			}
+			if standing.SeasonID > 0 && standing.ParticipantID > 0 {
+				key := fmt.Sprintf("%d-%d", standing.SeasonID, standing.ParticipantID)
+				if !seenPair[key] {
+					seenPair[key] = true
+					seasonTeams = append(seasonTeams, models.SeasonTeam{
+						SeasonID: standing.SeasonID,
+						TeamID:   standing.ParticipantID,
+					})
 				}
 			}
 		}
@@ -628,6 +911,9 @@ func (s *FootballScraper) ScrapeStandings(activeLeagueIDs map[uint]bool) (int, e
 			return 0, nil
 		}
 		err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&filtered, dbBatchSize).Error
+		if len(standingDetails) > 0 {
+			_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&standingDetails, dbBatchSize)
+		}
 		if len(seasonTeams) > 0 {
 			_ = s.DB.Clauses(clause.OnConflict{DoNothing: true}).CreateInBatches(&seasonTeams, dbBatchSize)
 		}
@@ -635,11 +921,25 @@ func (s *FootballScraper) ScrapeStandings(activeLeagueIDs map[uint]bool) (int, e
 	})
 }
 
-// ScrapeTopscorers fetches topscorers for all seasons belonging to the active leagues.
-func (s *FootballScraper) ScrapeTopscorers(activeLeagueIDs map[uint]bool) (int, error) {
+// ScrapeTopscorers fetches topscorers for current seasons belonging to active leagues.
+func (s *FootballScraper) ScrapeTopscorers(activeLeagueIDs map[uint]bool, currentSeasonIDs ...map[uint]bool) (int, error) {
+	var targetSeasons map[uint]bool
+	if len(currentSeasonIDs) > 0 {
+		targetSeasons = currentSeasonIDs[0]
+	} else {
+		targetSeasons = s.GetCurrentSeasonIDs(activeLeagueIDs)
+	}
+
+	var seasonIDs []uint
+	for id := range targetSeasons {
+		seasonIDs = append(seasonIDs, id)
+	}
+
 	var seasons []models.Season
 	query := s.DB
-	if len(activeLeagueIDs) > 0 {
+	if len(seasonIDs) > 0 {
+		query = query.Where("id IN ?", seasonIDs)
+	} else if len(activeLeagueIDs) > 0 {
 		var ids []uint
 		for id := range activeLeagueIDs {
 			ids = append(ids, id)
@@ -687,6 +987,14 @@ func (s *FootballScraper) ScrapeRivals() (int, error) {
 // ScrapeTransfers fetches all transfers.
 func (s *FootballScraper) ScrapeTransfers() (int, error) {
 	return scrapePaginated(s.Client, s.DB, "football/transfers", nil, func(data []models.Transfer) (int, error) {
+		err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&data, dbBatchSize).Error
+		return len(data), err
+	})
+}
+
+// ScrapeStates fetches all match states (NS, 1H, HT, 2H, FT, ET, PEN, etc.).
+func (s *FootballScraper) ScrapeStates() (int, error) {
+	return scrapePaginated(s.Client, s.DB, "football/states", nil, func(data []models.State) (int, error) {
 		err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&data, dbBatchSize).Error
 		return len(data), err
 	})

@@ -189,6 +189,8 @@ type Fixture struct {
 	Lineups    []FixtureLineup    `json:"lineups,omitempty" gorm:"foreignKey:FixtureID"`
 	Statistics []FixtureStatistic `json:"statistics,omitempty" gorm:"foreignKey:FixtureID"`
 	Scores     []FixtureScore     `json:"scores,omitempty" gorm:"foreignKey:FixtureID"`
+	// Belongs-To
+	State *State `json:"state,omitempty" gorm:"foreignKey:StateID;constraint:false;"`
 	// Many-to-Many
 	Referees []Referee `json:"referees,omitempty" gorm:"many2many:fixture_referees;"`
 }
@@ -259,20 +261,33 @@ type Referee struct {
 
 // Standing matches Sportmonks /v3/football/standings.
 type Standing struct {
-	ID             uint      `json:"id" gorm:"primaryKey;autoIncrement:false"`
-	ParticipantID  uint      `json:"participant_id" gorm:"index"`
-	SportID        uint      `json:"sport_id"`
-	LeagueID       uint      `json:"league_id" gorm:"index"`
-	SeasonID       uint      `json:"season_id" gorm:"index"`
-	StageID        *uint     `json:"stage_id"`
-	GroupID        *uint     `json:"group_id"`
-	RoundID        *uint     `json:"round_id"`
-	StandingRuleID *uint     `json:"standing_rule_id"`
-	Position       int       `json:"position"`
-	Result         string    `json:"result"`
-	Points         int       `json:"points"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID             uint             `json:"id" gorm:"primaryKey;autoIncrement:false"`
+	ParticipantID  uint             `json:"participant_id" gorm:"index"`
+	SportID        uint             `json:"sport_id"`
+	LeagueID       uint             `json:"league_id" gorm:"index"`
+	SeasonID       uint             `json:"season_id" gorm:"index"`
+	StageID        *uint            `json:"stage_id"`
+	GroupID        *uint            `json:"group_id"`
+	RoundID        *uint            `json:"round_id"`
+	StandingRuleID *uint            `json:"standing_rule_id"`
+	Position       int              `json:"position"`
+	Result         string           `json:"result"`
+	Points         int              `json:"points"`
+	CreatedAt      time.Time        `json:"created_at"`
+	UpdatedAt      time.Time        `json:"updated_at"`
+	Details        []StandingDetail `json:"details,omitempty" gorm:"foreignKey:StandingID;constraint:false;"`
+}
+
+// StandingDetail matches Sportmonks standing.details sub-entity.
+type StandingDetail struct {
+	ID           uint      `json:"id" gorm:"primaryKey;autoIncrement:false"`
+	StandingID   uint      `json:"standing_id" gorm:"index"`
+	StandingType string    `json:"standing_type"`
+	TypeID       uint      `json:"type_id" gorm:"index"`
+	Value        int       `json:"value"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Type         *Type     `json:"type,omitempty" gorm:"foreignKey:TypeID;constraint:false;"`
 }
 
 // Topscorer matches Sportmonks /v3/football/topscorers.
@@ -308,3 +323,16 @@ type Transfer struct {
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }
+
+// SyncTable tracks synchronization metadata, latest sync timestamp, and dynamic TTL intervals per dataset.
+type SyncTable struct {
+	TableName       string    `json:"table_name" gorm:"primaryKey"`
+	LatestSyncedAt  time.Time `json:"latest_synced_at"`
+	IntervalSeconds int       `json:"interval_seconds"`
+	RecordsSynced   int       `json:"records_synced"`
+	Status          string    `json:"status"` // "success", "failed", "in_progress", "skipped"
+	ErrorMessage    string    `json:"error_message,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+

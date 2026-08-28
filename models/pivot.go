@@ -61,22 +61,68 @@ type FixtureEvent struct {
 }
 
 // FixtureLineup represents the lineup for a fixture (starting XI + bench).
-// Sportmonks include: ?include=lineups
+// Sportmonks include: ?include=lineups.details
 type FixtureLineup struct {
-	ID                 uint      `json:"id" gorm:"primaryKey;autoIncrement:false"`
-	SportID            uint      `json:"sport_id"`
-	FixtureID          uint      `json:"fixture_id" gorm:"index"`
-	PlayerID           uint      `json:"player_id" gorm:"index"`
-	TeamID             uint      `json:"team_id" gorm:"index"`
-	PositionID         *uint     `json:"position_id"`
-	DetailedPositionID *uint     `json:"detailed_position_id"`
-	TypeID             *uint     `json:"type_id"`
-	FormationField     string    `json:"formation_field"`
-	FormationPosition  *int      `json:"formation_position"`
-	PlayerName         string    `json:"player_name"`
-	JerseyNumber       *int      `json:"jersey_number"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                 uint                  `json:"id" gorm:"primaryKey;autoIncrement:false"`
+	SportID            uint                  `json:"sport_id"`
+	FixtureID          uint                  `json:"fixture_id" gorm:"index"`
+	PlayerID           uint                  `json:"player_id" gorm:"index"`
+	TeamID             uint                  `json:"team_id" gorm:"index"`
+	PositionID         *uint                 `json:"position_id"`
+	DetailedPositionID *uint                 `json:"detailed_position_id"`
+	TypeID             *uint                 `json:"type_id"`
+	FormationField     string                `json:"formation_field"`
+	FormationPosition  *int                  `json:"formation_position"`
+	PlayerName         string                `json:"player_name"`
+	JerseyNumber       *int                  `json:"jersey_number"`
+	CreatedAt          time.Time             `json:"created_at"`
+	UpdatedAt          time.Time             `json:"updated_at"`
+	Details            []FixtureLineupDetail `json:"details,omitempty" gorm:"foreignKey:LineupID;constraint:false;"`
+}
+
+// FixtureLineupDetail represents in-match player statistics/performance metrics
+// (e.g. rating, minutes played, goals, assists, shots, passes, tackles, fouls, cards).
+// Sportmonks include: ?include=lineups.details
+type FixtureLineupDetail struct {
+	ID        uint      `json:"id" gorm:"primaryKey;autoIncrement:false"`
+	FixtureID uint      `json:"fixture_id" gorm:"index"`
+	LineupID  uint      `json:"lineup_id" gorm:"index"`
+	PlayerID  uint      `json:"player_id" gorm:"index"`
+	TypeID    uint      `json:"type_id" gorm:"index"`
+	Value     *float64  `json:"value" gorm:"column:value"`
+	DataValue *string   `json:"data_value" gorm:"column:data_value;type:jsonb"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (d *FixtureLineupDetail) UnmarshalJSON(data []byte) error {
+	type Alias FixtureLineupDetail
+	aux := &struct {
+		Data json.RawMessage `json:"data"`
+		*Alias
+	}{
+		Alias: (*Alias)(d),
+	}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	if len(aux.Data) > 0 && string(aux.Data) != "null" {
+		str := string(aux.Data)
+		d.DataValue = &str
+
+		var valObj struct {
+			Value *float64 `json:"value"`
+		}
+		if err := json.Unmarshal(aux.Data, &valObj); err == nil && valObj.Value != nil {
+			d.Value = valObj.Value
+		} else {
+			var num float64
+			if err := json.Unmarshal(aux.Data, &num); err == nil {
+				d.Value = &num
+			}
+		}
+	}
+	return nil
 }
 
 // FixtureStatistic represents team-level statistics for a fixture (possession, shots, passes, etc.).

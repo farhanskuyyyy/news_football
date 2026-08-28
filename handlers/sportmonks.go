@@ -3,6 +3,8 @@ package handlers
 import (
 	"net/http"
 
+	"github.com/farhanarfianto/apigo-docker/database"
+	"github.com/farhanarfianto/apigo-docker/models"
 	"github.com/farhanarfianto/apigo-docker/services"
 	"github.com/labstack/echo/v4"
 )
@@ -56,19 +58,59 @@ func (h *SportmonksHandler) ScrapeLeaguesData(c echo.Context) error {
 }
 
 // ScrapeFootballData triggers fetching and saving all Football entities into DB.
+// Supports ?force=true to bypass TTL checks.
 func (h *SportmonksHandler) ScrapeFootballData(c echo.Context) error {
 	if h.FootballScraper == nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
 	}
 
-	result, err := h.FootballScraper.ScrapeAllFootball()
+	force := c.QueryParam("force") == "true" || c.QueryParam("force") == "1"
+	result, err := h.FootballScraper.ScrapeAllFootball(force)
 	if err != nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
 	return c.JSON(http.StatusOK, echo.Map{
 		"status":  "success",
+		"force":   force,
 		"scraped": result,
+	})
+}
+
+// GetSyncStatus returns the synchronization tracker status for all tables.
+func (h *SportmonksHandler) GetSyncStatus(c echo.Context) error {
+	if h.FootballScraper == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
+	}
+
+	var syncRecords []models.SyncTable
+	if err := h.FootballScraper.DB.Order("table_name ASC").Find(&syncRecords).Error; err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"status": "success",
+		"data":   syncRecords,
+	})
+}
+
+// SeedSyncTablesHandler manually re-seeds the sync_tables configurations.
+func (h *SportmonksHandler) SeedSyncTablesHandler(c echo.Context) error {
+	if h.FootballScraper == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
+	}
+
+	if err := database.SeedSyncTables(h.FootballScraper.DB); err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	var syncRecords []models.SyncTable
+	_ = h.FootballScraper.DB.Order("table_name ASC").Find(&syncRecords)
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"status":  "success",
+		"message": "sync_tables successfully seeded",
+		"data":    syncRecords,
 	})
 }
 

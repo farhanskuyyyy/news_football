@@ -31,7 +31,8 @@ func ConnectPostgres(cfg *config.Config) (*gorm.DB, error) {
 	)
 
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{
-		Logger: newLogger,
+		Logger:                                  newLogger,
+		DisableForeignKeyConstraintWhenMigrating: true,
 	})
 	if err != nil {
 		return nil, err
@@ -58,11 +59,13 @@ func ConnectPostgres(cfg *config.Config) (*gorm.DB, error) {
 		&models.Coach{},
 		&models.Referee{},
 		&models.Standing{},
+		&models.StandingDetail{},
 		&models.Topscorer{},
 		&models.Transfer{},
 		// Fixture sub-entities
 		&models.FixtureEvent{},
 		&models.FixtureLineup{},
+		&models.FixtureLineupDetail{},
 		&models.FixtureStatistic{},
 		&models.FixtureScore{},
 		&models.Commentary{},
@@ -73,9 +76,14 @@ func ConnectPostgres(cfg *config.Config) (*gorm.DB, error) {
 		&models.PlayerStatistic{},
 		&models.TeamRival{},
 		&models.FixtureReferee{},
+		&models.SyncTable{},
 	); err != nil {
 		return nil, err
 	}
+
+	// Auto-seed default sync_tables configuration
+	_ = SeedSyncTables(db)
+
 	return db, nil
 }
 
