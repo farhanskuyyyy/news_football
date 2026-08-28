@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/farhanarfianto/apigo-docker/database"
 	"github.com/farhanarfianto/apigo-docker/models"
@@ -78,6 +79,51 @@ func (h *SportmonksHandler) ScrapeFootballData(c echo.Context) error {
 }
 
 // GetSyncStatus returns the synchronization tracker status for all tables.
+// ScrapeFixtureDetailsData triggers full per-fixture detail scraping (events,
+// lineups + details, statistics, scores) for active leagues' current seasons.
+// Query params: ?force=true reprocesses fixtures that already have events;
+// ?limit=N caps how many fixtures; ?season_id=ID targets one season.
+func (h *SportmonksHandler) ScrapeFixtureDetailsData(c echo.Context) error {
+	if h.FootballScraper == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
+	}
+
+	force := c.QueryParam("force") == "true" || c.QueryParam("force") == "1"
+	limit, _ := strconv.Atoi(c.QueryParam("limit"))
+	seasonID, _ := strconv.Atoi(c.QueryParam("season_id"))
+
+	result, err := h.FootballScraper.ScrapeFixtureDetails(limit, force, uint(seasonID))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"status":  "success",
+		"force":   force,
+		"scraped": result,
+	})
+}
+
+// ScrapePlayerStatisticsData triggers player season-statistics scraping for
+// active leagues' current seasons. Bounded per call; call repeatedly for a full
+// init. ?season_id=ID targets one season.
+func (h *SportmonksHandler) ScrapePlayerStatisticsData(c echo.Context) error {
+	if h.FootballScraper == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
+	}
+
+	seasonID, _ := strconv.Atoi(c.QueryParam("season_id"))
+	count, err := h.FootballScraper.ScrapePlayerStatisticsInit(uint(seasonID))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"status":  "success",
+		"scraped": echo.Map{"player_statistics": count},
+	})
+}
+
 func (h *SportmonksHandler) GetSyncStatus(c echo.Context) error {
 	if h.FootballScraper == nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")

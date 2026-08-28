@@ -62,6 +62,8 @@ func SetupRoutes(e *echo.Echo, h *handlers.NewsHandler, smh *handlers.Sportmonks
 		sm.POST("/scrape/core", smh.ScrapeCoreData)
 		sm.POST("/scrape/leagues", smh.ScrapeLeaguesData)
 		sm.POST("/scrape/football", smh.ScrapeFootballData)
+		sm.POST("/scrape/fixture-details", smh.ScrapeFixtureDetailsData)
+		sm.POST("/scrape/player-statistics", smh.ScrapePlayerStatisticsData)
 		sm.GET("/sync/status", smh.GetSyncStatus)
 		sm.POST("/sync/seed", smh.SeedSyncTablesHandler)
 

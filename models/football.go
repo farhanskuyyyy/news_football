@@ -290,6 +290,19 @@ type StandingDetail struct {
 	Type         *Type     `json:"type,omitempty" gorm:"foreignKey:TypeID;constraint:false;"`
 }
 
+// StandingForm matches the Sportmonks standings `form` include — recent match
+// results (W/D/L) per team, ordered by sort_order. Composite PK (standing_id,
+// sort_order) keeps upserts idempotent without depending on Sportmonks row ids.
+// Sportmonks include: ?include=form
+type StandingForm struct {
+	StandingID uint      `json:"standing_id" gorm:"primaryKey;autoIncrement:false;index"`
+	SortOrder  int       `json:"sort_order" gorm:"primaryKey;autoIncrement:false"`
+	FixtureID  *uint     `json:"fixture_id"`
+	Form       string    `json:"form"` // "W" | "D" | "L"
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
+}
+
 // Topscorer matches Sportmonks /v3/football/topscorers.
 type Topscorer struct {
 	ID              uint      `json:"id" gorm:"primaryKey;autoIncrement:false"`

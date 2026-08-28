@@ -60,6 +60,7 @@ func ConnectPostgres(cfg *config.Config) (*gorm.DB, error) {
 		&models.Referee{},
 		&models.Standing{},
 		&models.StandingDetail{},
+		&models.StandingForm{},
 		&models.Topscorer{},
 		&models.Transfer{},
 		// Fixture sub-entities
@@ -75,6 +76,7 @@ func ConnectPostgres(cfg *config.Config) (*gorm.DB, error) {
 		&models.PlayerSeason{},
 		&models.PlayerStatistic{},
 		&models.TeamRival{},
+		&models.TeamCoach{},
 		&models.FixtureReferee{},
 		&models.SyncTable{},
 	); err != nil {

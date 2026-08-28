@@ -30,6 +30,19 @@ type TeamRival struct {
 	RivalID uint `json:"rival_id" gorm:"index"`
 }
 
+// TeamCoach links a team to its coach(es), captured from the team `coaches`
+// include during team scraping. Composite PK keeps upserts idempotent. Written
+// only by the team scraper, so a plain Team upsert elsewhere never clobbers it.
+type TeamCoach struct {
+	TeamID    uint      `json:"team_id" gorm:"primaryKey;autoIncrement:false;index"`
+	CoachID   uint      `json:"coach_id" gorm:"primaryKey;autoIncrement:false"`
+	Active    bool      `json:"active"`
+	Start     *string   `json:"start"`
+	End       *string   `json:"end"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Fixture Sub-Entities (one-to-many from Fixture, but also pivot/M2M)
 // ──────────────────────────────────────────────────────────────────────────────
@@ -239,14 +252,14 @@ type FixtureReferee struct {
 // Commentary represents live text commentary for a fixture.
 // Sportmonks endpoint: /football/commentaries/fixtures/:fixtureId
 type Commentary struct {
-	ID           uint   `json:"id" gorm:"primaryKey;autoIncrement:false"`
-	FixtureID    uint   `json:"fixture_id" gorm:"index"`
-	Comment      string `json:"comment"`
-	Minute       *int   `json:"minute"`
-	ExtraMinute  *int   `json:"extra_minute"`
-	IsGoal       bool   `json:"is_goal"`
-	IsImportant  bool   `json:"is_important"`
-	Order        int    `json:"order"`
+	ID          uint   `json:"id" gorm:"primaryKey;autoIncrement:false"`
+	FixtureID   uint   `json:"fixture_id" gorm:"index"`
+	Comment     string `json:"comment"`
+	Minute      *int   `json:"minute"`
+	ExtraMinute *int   `json:"extra_minute"`
+	IsGoal      bool   `json:"is_goal"`
+	IsImportant bool   `json:"is_important"`
+	Order       int    `json:"order"`
 }
 
 // State represents the match state (e.g. NS, 1H, HT, 2H, FT, ET, PEN, etc.).
@@ -265,10 +278,11 @@ type State struct {
 
 // PlayerStatistic stores aggregated player performance stats per season/team.
 type PlayerStatistic struct {
-	ID          uint      `json:"id" gorm:"primaryKey"`
-	PlayerID    uint      `json:"player_id" gorm:"index"`
-	SeasonID    uint      `json:"season_id" gorm:"index"`
-	TeamID      uint      `json:"team_id" gorm:"index"`
+	// Composite PK (player_id, season_id, team_id) keeps the per-season aggregate
+	// idempotent across re-scrapes instead of inserting a new auto-id row each run.
+	PlayerID    uint      `json:"player_id" gorm:"primaryKey;autoIncrement:false;index"`
+	SeasonID    uint      `json:"season_id" gorm:"primaryKey;autoIncrement:false;index"`
+	TeamID      uint      `json:"team_id" gorm:"primaryKey;autoIncrement:false;index"`
 	PositionID  *uint     `json:"position_id"`
 	Goals       int       `json:"goals"`
 	Assists     int       `json:"assists"`

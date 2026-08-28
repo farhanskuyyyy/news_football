@@ -3,6 +3,7 @@ package handlers
 import (
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -144,6 +145,7 @@ type StandingItem struct {
 	GoalsFor       int                      `json:"goals_for"`
 	GoalsAgainst   int                      `json:"goals_against"`
 	GoalDifference int                      `json:"goal_difference"`
+	Form           []string                 `json:"form"` // recent results, oldest→newest e.g. ["W","W","D","L","W"]
 	Details        []EnrichedStandingDetail `json:"details"`
 }
 
@@ -170,6 +172,19 @@ func (h *PortalHandler) GetSeasonStandings(c echo.Context) error {
 	var allDetails []models.StandingDetail
 	if len(standingIDs) > 0 {
 		h.DB.Where("standing_id IN ?", standingIDs).Find(&allDetails)
+	}
+
+	// Fetch recent-form rows and group as ordered W/D/L letters per standing
+	formByStanding := make(map[uint][]string)
+	if len(standingIDs) > 0 {
+		var allForms []models.StandingForm
+		h.DB.Where("standing_id IN ?", standingIDs).Order("sort_order ASC").Find(&allForms)
+		for _, fm := range allForms {
+			if fm.Form == "" {
+				continue
+			}
+			formByStanding[fm.StandingID] = append(formByStanding[fm.StandingID], strings.ToUpper(fm.Form))
+		}
 	}
 
 	// Fetch distinct Types
@@ -240,12 +255,25 @@ func (h *PortalHandler) GetSeasonStandings(c echo.Context) error {
 		gd := 0
 
 		for _, dt := range details {
+			// Skip HOME/AWAY split rows — they reuse the same metric names
+			// ("won", "lost", ...) as the overall row and would otherwise
+			// overwrite the totals depending on array order (the cause of a few
+			// teams showing wrong W/D/L). Only the overall row is aggregated.
+			stLower := strings.ToLower(dt.StandingType)
+			if strings.Contains(stLower, "home") || strings.Contains(stLower, "away") {
+				continue
+			}
+
 			tLower := strings.ToLower(dt.TypeName)
 			codeLower := ""
 			if dt.Type != nil {
 				codeLower = strings.ToLower(dt.Type.Code + " " + dt.Type.DeveloperName)
 			}
 			combined := tLower + " " + codeLower
+
+			if strings.Contains(combined, "home") || strings.Contains(combined, "away") {
+				continue
+			}
 
 			if strings.Contains(combined, "played") || strings.Contains(combined, "matches-played") || dt.TypeID == 129 {
 				played = dt.Value
@@ -271,6 +299,15 @@ func (h *PortalHandler) GetSeasonStandings(c echo.Context) error {
 			played = won + draw + lost
 		}
 
+		// Recent form: keep last 5 (most recent) results, oldest→newest
+		form := formByStanding[st.ID]
+		if len(form) > 5 {
+			form = form[len(form)-5:]
+		}
+		if form == nil {
+			form = []string{}
+		}
+
 		items = append(items, StandingItem{
 			Standing:       st,
 			Team:           &tm,
@@ -281,6 +318,7 @@ func (h *PortalHandler) GetSeasonStandings(c echo.Context) error {
 			GoalsFor:       gf,
 			GoalsAgainst:   ga,
 			GoalDifference: gd,
+			Form:           form,
 			Details:        details,
 		})
 	}
@@ -895,7 +933,9 @@ func (h *PortalHandler) GetFixtureDetail(c echo.Context) error {
 			} else if dt.DataValue != nil {
 				valStr = *dt.DataValue
 			}
-			if strings.Contains(strings.ToLower(tName), "rating") && dt.Value != nil {
+			// Rating comes from type_id 118 (fallback to name match when the type
+			// dictionary resolved the name).
+			if (dt.TypeID == 118 || strings.Contains(strings.ToLower(tName), "rating")) && dt.Value != nil {
 				elp.Rating = dt.Value
 			}
 			elp.Stats = append(elp.Stats, PlayerInMatchStat{
@@ -1052,18 +1092,75 @@ func (h *PortalHandler) GetTeamDetail(c echo.Context) error {
 		h.DB.Where("id IN ?", playerIDs).Find(&players)
 	}
 
-	// Team Rivals
-	var rivals []models.TeamRival
-	h.DB.Where("team_id = ? OR rival_id = ?", teamID, teamID).Find(&rivals)
+	// Resolve position_id -> position name (from the scraped Type dictionary) so
+	// the frontend can label squad players instead of hardcoding position ids.
+	posIDSet := make(map[uint]bool)
+	for _, p := range players {
+		if p.PositionID != nil && *p.PositionID > 0 {
+			posIDSet[*p.PositionID] = true
+		}
+	}
+	positions := make(map[uint]string)
+	if len(posIDSet) > 0 {
+		var ids []uint
+		for id := range posIDSet {
+			ids = append(ids, id)
+		}
+		var types []models.Type
+		h.DB.Where("id IN ?", ids).Find(&types)
+		for _, t := range types {
+			name := t.Name
+			if name == "" {
+				name = t.DeveloperName
+			}
+			positions[t.ID] = name
+		}
+	}
+
+	// Team Rivals — resolve the "other" team in each pivot into full team rows
+	// so the frontend gets names/logos instead of bare ids.
+	tid := uint(teamID)
+	var rivalPivots []models.TeamRival
+	h.DB.Where("team_id = ? OR rival_id = ?", teamID, teamID).Find(&rivalPivots)
+	rivalIDSet := make(map[uint]bool)
+	for _, rv := range rivalPivots {
+		other := rv.RivalID
+		if other == tid {
+			other = rv.TeamID
+		}
+		if other > 0 && other != tid {
+			rivalIDSet[other] = true
+		}
+	}
+	var rivals []models.Team
+	if len(rivalIDSet) > 0 {
+		var rivalIDs []uint
+		for id := range rivalIDSet {
+			rivalIDs = append(rivalIDs, id)
+		}
+		h.DB.Where("id IN ?", rivalIDs).Find(&rivals)
+	}
+
+	// Head coach — prefer the active link, fall back to most recent.
+	var coach *models.Coach
+	var tc models.TeamCoach
+	if err := h.DB.Where("team_id = ?", teamID).Order("active DESC, updated_at DESC").First(&tc).Error; err == nil && tc.CoachID > 0 {
+		var ch models.Coach
+		if err := h.DB.First(&ch, tc.CoachID).Error; err == nil {
+			coach = &ch
+		}
+	}
 
 	return c.JSON(http.StatusOK, echo.Map{
 		"status": "success",
 		"data": echo.Map{
-			"team":    team,
-			"venue":   venue,
-			"squads":  squads,
-			"players": players,
-			"rivals":  rivals,
+			"team":      team,
+			"venue":     venue,
+			"coach":     coach,
+			"squads":    squads,
+			"players":   players,
+			"positions": positions,
+			"rivals":    rivals,
 		},
 	})
 }
@@ -1110,25 +1207,304 @@ func (h *PortalHandler) GetPlayerDetail(c echo.Context) error {
 	if len(teamIDs) > 0 {
 		h.DB.Where("id IN ?", teamIDs).Find(&teams)
 	}
+	playerTeamByID := make(map[uint]models.Team)
+	for _, t := range teams {
+		playerTeamByID[t.ID] = t
+	}
 
-	// Recent transfers
-	var transfers []models.Transfer
-	h.DB.Where("player_id = ?", playerID).Order("date DESC").Find(&transfers)
+	// Club history: one row per squad membership (club + season + jersey +
+	// captain + current flag). Explains why a player shows more than one club —
+	// each is a different season's registration.
+	seasonNameByID := make(map[uint]string)
+	seasonCurrentByID := make(map[uint]bool)
+	{
+		seasonSet := make(map[uint]bool)
+		for _, sq := range squads {
+			if sq.SeasonID != nil && *sq.SeasonID > 0 {
+				seasonSet[*sq.SeasonID] = true
+			}
+		}
+		if len(seasonSet) > 0 {
+			var ids []uint
+			for id := range seasonSet {
+				ids = append(ids, id)
+			}
+			var seasons []models.Season
+			h.DB.Where("id IN ?", ids).Find(&seasons)
+			for _, s := range seasons {
+				seasonNameByID[s.ID] = s.Name
+				seasonCurrentByID[s.ID] = s.IsCurrent
+			}
+		}
+	}
+	type ClubHistoryItem struct {
+		TeamID       uint         `json:"team_id"`
+		Team         *models.Team `json:"team,omitempty"`
+		SeasonID     uint         `json:"season_id"`
+		SeasonName   string       `json:"season_name"`
+		JerseyNumber *int         `json:"jersey_number"`
+		Captain      bool         `json:"captain"`
+		IsCurrent    bool         `json:"is_current"`
+	}
+	var clubHistory []ClubHistoryItem
+	for _, sq := range squads {
+		ci := ClubHistoryItem{TeamID: sq.TeamID, JerseyNumber: sq.JerseyNumber, Captain: sq.Captain}
+		if sq.SeasonID != nil {
+			ci.SeasonID = *sq.SeasonID
+			ci.SeasonName = seasonNameByID[*sq.SeasonID]
+			ci.IsCurrent = seasonCurrentByID[*sq.SeasonID]
+		}
+		if t, ok := playerTeamByID[sq.TeamID]; ok {
+			tt := t
+			ci.Team = &tt
+		}
+		clubHistory = append(clubHistory, ci)
+	}
+	// Current seasons first, then most-recent season id.
+	sort.Slice(clubHistory, func(i, j int) bool {
+		if clubHistory[i].IsCurrent != clubHistory[j].IsCurrent {
+			return clubHistory[i].IsCurrent
+		}
+		return clubHistory[i].SeasonID > clubHistory[j].SeasonID
+	})
 
-	// Topscorer records
-	var topscorers []models.Topscorer
-	h.DB.Where("player_id = ?", playerID).Find(&topscorers)
+	// Recent transfers — enriched with from/to team objects + type name so the
+	// frontend can render club names and the fee.
+	var rawTransfers []models.Transfer
+	h.DB.Where("player_id = ?", playerID).Order("date DESC").Find(&rawTransfers)
+
+	type TransferItem struct {
+		models.Transfer
+		FromTeam *models.Team `json:"from_team,omitempty"`
+		ToTeam   *models.Team `json:"to_team,omitempty"`
+		TypeName string       `json:"type_name,omitempty"`
+	}
+	var transfers []TransferItem
+	if len(rawTransfers) > 0 {
+		teamSet := make(map[uint]bool)
+		typeSet := make(map[uint]bool)
+		for _, tr := range rawTransfers {
+			if tr.FromTeamID != nil {
+				teamSet[*tr.FromTeamID] = true
+			}
+			if tr.ToTeamID != nil {
+				teamSet[*tr.ToTeamID] = true
+			}
+			if tr.TypeID != nil {
+				typeSet[*tr.TypeID] = true
+			}
+		}
+		teamByID := make(map[uint]models.Team)
+		if len(teamSet) > 0 {
+			var ids []uint
+			for id := range teamSet {
+				ids = append(ids, id)
+			}
+			var tms []models.Team
+			h.DB.Where("id IN ?", ids).Find(&tms)
+			for _, t := range tms {
+				teamByID[t.ID] = t
+			}
+		}
+		typeNames := make(map[uint]string)
+		if len(typeSet) > 0 {
+			var ids []uint
+			for id := range typeSet {
+				ids = append(ids, id)
+			}
+			var types []models.Type
+			h.DB.Where("id IN ?", ids).Find(&types)
+			for _, t := range types {
+				typeNames[t.ID] = t.Name
+			}
+		}
+		for _, tr := range rawTransfers {
+			item := TransferItem{Transfer: tr}
+			if tr.FromTeamID != nil {
+				if t, ok := teamByID[*tr.FromTeamID]; ok {
+					tt := t
+					item.FromTeam = &tt
+				}
+			}
+			if tr.ToTeamID != nil {
+				if t, ok := teamByID[*tr.ToTeamID]; ok {
+					tt := t
+					item.ToTeam = &tt
+				}
+			}
+			if tr.TypeID != nil {
+				item.TypeName = typeNames[*tr.TypeID]
+			}
+			transfers = append(transfers, item)
+		}
+	}
+
+	// Per-season statistics, enriched with season name + team.
+	var rawStats []models.PlayerStatistic
+	h.DB.Where("player_id = ?", playerID).Find(&rawStats)
+
+	type PlayerStatItem struct {
+		models.PlayerStatistic
+		SeasonName string       `json:"season_name"`
+		Team       *models.Team `json:"team,omitempty"`
+	}
+	var statistics []PlayerStatItem
+	if len(rawStats) > 0 {
+		seasonSet := make(map[uint]bool)
+		teamSet := make(map[uint]bool)
+		for _, st := range rawStats {
+			seasonSet[st.SeasonID] = true
+			teamSet[st.TeamID] = true
+		}
+		seasonNames := make(map[uint]string)
+		if len(seasonSet) > 0 {
+			var ids []uint
+			for id := range seasonSet {
+				ids = append(ids, id)
+			}
+			var seasons []models.Season
+			h.DB.Where("id IN ?", ids).Find(&seasons)
+			for _, s := range seasons {
+				seasonNames[s.ID] = s.Name
+			}
+		}
+		teamByID := make(map[uint]models.Team)
+		if len(teamSet) > 0 {
+			var ids []uint
+			for id := range teamSet {
+				ids = append(ids, id)
+			}
+			var tms []models.Team
+			h.DB.Where("id IN ?", ids).Find(&tms)
+			for _, t := range tms {
+				teamByID[t.ID] = t
+			}
+		}
+		for _, st := range rawStats {
+			item := PlayerStatItem{PlayerStatistic: st, SeasonName: seasonNames[st.SeasonID]}
+			if t, ok := teamByID[st.TeamID]; ok {
+				tt := t
+				item.Team = &tt
+			}
+			statistics = append(statistics, item)
+		}
+	}
+
+	// Topscorer records — enriched with season name, metric (type) name, and team.
+	var rawTopscorers []models.Topscorer
+	h.DB.Where("player_id = ?", playerID).Find(&rawTopscorers)
+
+	type TopscorerRecord struct {
+		models.Topscorer
+		SeasonName string       `json:"season_name"`
+		TypeName   string       `json:"type_name"`
+		Team       *models.Team `json:"team,omitempty"`
+	}
+	var topscorers []TopscorerRecord
+	if len(rawTopscorers) > 0 {
+		tsSeasonSet := make(map[uint]bool)
+		tsTypeSet := make(map[uint]bool)
+		tsTeamSet := make(map[uint]bool)
+		for _, ts := range rawTopscorers {
+			if ts.SeasonID != nil {
+				tsSeasonSet[*ts.SeasonID] = true
+			}
+			tsTypeSet[ts.TypeID] = true
+			if ts.ParticipantID > 0 {
+				tsTeamSet[ts.ParticipantID] = true
+			}
+		}
+		tsSeasonName := make(map[uint]string)
+		if len(tsSeasonSet) > 0 {
+			var ids []uint
+			for id := range tsSeasonSet {
+				ids = append(ids, id)
+			}
+			var seasons []models.Season
+			h.DB.Where("id IN ?", ids).Find(&seasons)
+			for _, s := range seasons {
+				tsSeasonName[s.ID] = s.Name
+			}
+		}
+		tsTypeName := make(map[uint]string)
+		if len(tsTypeSet) > 0 {
+			var ids []uint
+			for id := range tsTypeSet {
+				ids = append(ids, id)
+			}
+			var types []models.Type
+			h.DB.Where("id IN ?", ids).Find(&types)
+			for _, t := range types {
+				tsTypeName[t.ID] = t.Name
+			}
+		}
+		tsTeamByID := make(map[uint]models.Team)
+		if len(tsTeamSet) > 0 {
+			var ids []uint
+			for id := range tsTeamSet {
+				ids = append(ids, id)
+			}
+			var tms []models.Team
+			h.DB.Where("id IN ?", ids).Find(&tms)
+			for _, t := range tms {
+				tsTeamByID[t.ID] = t
+			}
+		}
+		for _, ts := range rawTopscorers {
+			// Skip records with no season — they can't be grouped and are noise.
+			if ts.SeasonID == nil || *ts.SeasonID == 0 {
+				continue
+			}
+			rec := TopscorerRecord{Topscorer: ts, TypeName: tsTypeName[ts.TypeID]}
+			rec.SeasonName = tsSeasonName[*ts.SeasonID]
+			if t, ok := tsTeamByID[ts.ParticipantID]; ok {
+				tt := t
+				rec.Team = &tt
+			}
+			topscorers = append(topscorers, rec)
+		}
+		// Newest season first, then by rank within a season.
+		sort.Slice(topscorers, func(i, j int) bool {
+			si := topscorers[i].SeasonID
+			sj := topscorers[j].SeasonID
+			if si != nil && sj != nil && *si != *sj {
+				return *si > *sj
+			}
+			return topscorers[i].Position < topscorers[j].Position
+		})
+	}
+
+	// Resolve position + detailed position names from the Type dictionary.
+	resolveType := func(id *uint) string {
+		if id == nil || *id == 0 {
+			return ""
+		}
+		var t models.Type
+		if err := h.DB.First(&t, *id).Error; err == nil {
+			if t.Name != "" {
+				return t.Name
+			}
+			return t.DeveloperName
+		}
+		return ""
+	}
+	position := resolveType(player.PositionID)
+	detailedPosition := resolveType(player.DetailedPositionID)
 
 	return c.JSON(http.StatusOK, echo.Map{
 		"status": "success",
 		"data": echo.Map{
-			"player":      player,
-			"country":     country,
-			"nationality": nationality,
-			"squads":      squads,
-			"teams":       teams,
-			"transfers":   transfers,
-			"topscorers":  topscorers,
+			"player":            player,
+			"country":           country,
+			"nationality":       nationality,
+			"position":          position,
+			"detailed_position": detailedPosition,
+			"squads":            squads,
+			"teams":             teams,
+			"club_history":      clubHistory,
+			"transfers":         transfers,
+			"topscorers":        topscorers,
+			"statistics":        statistics,
 		},
 	})
 }
