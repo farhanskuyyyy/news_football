@@ -14,6 +14,8 @@ services:
       NEWS_API_URL: ${NEWS_API_URL:-https://newsapi.org/v2/everything?q=European%20football&language=en&sortBy=publishedAt}
       NEWS_API_KEY: ${NEWS_API_KEY}
       REFRESH_TOKEN: ${REFRESH_TOKEN:-}
+      SPORTMONKS_BASE_URL: ${SPORTMONKS_BASE_URL:-https://api.sportmonks.com/v3}
+      SPORTMONKS_API_TOKEN: ${SPORTMONKS_API_TOKEN:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -47,6 +49,39 @@ services:
       timeout: 5s
       retries: 5
 
+  rabbitmq:
+    image: rabbitmq:3-management-alpine
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmqdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafanadata:/var/lib/grafana
+    restart: unless-stopped
+
 volumes:
   pgdata:
   redisdata:
+  rabbitmqdata:
+  grafanadata:
+

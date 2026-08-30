@@ -14,8 +14,9 @@ env: ## Create .env from .env.example if missing
 	@test -f .env || (cp .env.example .env && echo ".env created, set NEWS_API_KEY")
 
 .PHONY: deps
-deps: ## Start only Postgres + Redis (for local go run)
-	$(COMPOSE) up -d postgres redis
+deps: ## Start Postgres, Redis, RabbitMQ, Grafana for local dev
+	$(COMPOSE) up -d postgres redis rabbitmq grafana
+
 
 .PHONY: run
 run: env deps ## Run app locally (Postgres + Redis via Docker)
@@ -75,6 +76,32 @@ psql: ## Open psql shell in Postgres container
 .PHONY: redis-cli
 redis-cli: ## Open redis-cli in Redis container
 	$(COMPOSE) exec redis redis-cli
+
+## ---------- RabbitMQ / Grafana ----------
+
+.PHONY: rabbitmq
+rabbitmq: ## Start RabbitMQ (AMQP :5672, UI http://localhost:15672, guest/guest)
+	$(COMPOSE) up -d rabbitmq
+
+.PHONY: rabbitmq-logs
+rabbitmq-logs: ## Tail RabbitMQ logs
+	$(COMPOSE) logs -f rabbitmq
+
+.PHONY: rabbitmq-ui
+rabbitmq-ui: ## Open RabbitMQ management UI in browser
+	open http://localhost:15672
+
+.PHONY: grafana
+grafana: ## Start Grafana (http://localhost:3000, admin/admin)
+	$(COMPOSE) up -d grafana
+
+.PHONY: grafana-logs
+grafana-logs: ## Tail Grafana logs
+	$(COMPOSE) logs -f grafana
+
+.PHONY: grafana-ui
+grafana-ui: ## Open Grafana in browser
+	open http://localhost:3000
 
 ## ---------- Smoke test ----------
 
