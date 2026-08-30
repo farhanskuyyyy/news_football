@@ -1,13 +1,14 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
-	"github.com/glebarez/sqlite"
 	"github.com/farhanarfianto/apigo-docker/models"
+	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 )
 
@@ -51,7 +52,7 @@ func TestCoreScraper(t *testing.T) {
 	smClient := NewSportmonksClient(server.URL+"/v3", "test-token")
 	scraper := NewCoreScraper(db, smClient)
 
-	result, err := scraper.ScrapeAll()
+	result, err := scraper.ScrapeAll(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error scraping all: %v", err)
 	}

@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -102,7 +103,7 @@ func TestFootballScraper(t *testing.T) {
 	scraper := NewFootballScraper(db, smClient)
 
 	// Step 1: Scrape Leagues
-	leaguesCount, err := scraper.ScrapeLeagues()
+	leaguesCount, err := scraper.ScrapeLeagues(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error scraping leagues: %v", err)
 	}
@@ -111,7 +112,7 @@ func TestFootballScraper(t *testing.T) {
 	}
 
 	// Step 2: Scrape Football for Active Leagues (where status = true AND active = true)
-	result, err := scraper.ScrapeAllFootball()
+	result, err := scraper.ScrapeAllFootball(context.Background())
 	if err != nil {
 		t.Fatalf("unexpected error scraping football: %v", err)
 	}

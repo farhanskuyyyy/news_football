@@ -1,6 +1,7 @@
 package services
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -47,38 +48,50 @@ func NewCoreScraper(db *gorm.DB, client *SportmonksClient) *CoreScraper {
 }
 
 // ScrapeAll fetches and saves all data for Continents, Countries, Regions, Cities, and Types from Sportmonks v3 API.
-func (s *CoreScraper) ScrapeAll() (*CoreScrapeResult, error) {
+func (s *CoreScraper) ScrapeAll(ctx context.Context) (*CoreScrapeResult, error) {
 	result := &CoreScrapeResult{}
 
-	continents, err := s.ScrapeContinents()
+	continents, err := s.ScrapeContinents(ctx)
 	if err != nil {
 		log.Printf("[CoreScraper] Error scraping continents: %v", err)
 	} else {
 		result.Continents = continents
 	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
 
-	countries, err := s.ScrapeCountries()
+	countries, err := s.ScrapeCountries(ctx)
 	if err != nil {
 		log.Printf("[CoreScraper] Error scraping countries: %v", err)
 	} else {
 		result.Countries = countries
 	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
 
-	regions, err := s.ScrapeRegions()
+	regions, err := s.ScrapeRegions(ctx)
 	if err != nil {
 		log.Printf("[CoreScraper] Error scraping regions: %v", err)
 	} else {
 		result.Regions = regions
 	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
 
-	cities, err := s.ScrapeCities()
+	cities, err := s.ScrapeCities(ctx)
 	if err != nil {
 		log.Printf("[CoreScraper] Error scraping cities: %v", err)
 	} else {
 		result.Cities = cities
 	}
+	if ctx.Err() != nil {
+		return result, ctx.Err()
+	}
 
-	types, err := s.ScrapeTypes()
+	types, err := s.ScrapeTypes(ctx)
 	if err != nil {
 		log.Printf("[CoreScraper] Error scraping types: %v", err)
 	} else {
@@ -89,12 +102,16 @@ func (s *CoreScraper) ScrapeAll() (*CoreScrapeResult, error) {
 }
 
 // scrapeCoreEntity is a generic helper to paginate any Core entity endpoint with cursor support.
-func scrapeCoreEntity[T any](client *SportmonksClient, db *gorm.DB, endpoint string) (int, error) {
+func scrapeCoreEntity[T any](ctx context.Context, client *SportmonksClient, db *gorm.DB, endpoint string) (int, error) {
 	var total int
 	page := 1
 	var cursor string
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+
 		params := make(map[string]string)
 
 		if cursor != "" {
@@ -148,26 +165,26 @@ func scrapeCoreEntity[T any](client *SportmonksClient, db *gorm.DB, endpoint str
 }
 
 // ScrapeContinents fetches all pages of continents and upserts into DB.
-func (s *CoreScraper) ScrapeContinents() (int, error) {
-	return scrapeCoreEntity[models.Continent](s.Client, s.DB, "core/continents")
+func (s *CoreScraper) ScrapeContinents(ctx context.Context) (int, error) {
+	return scrapeCoreEntity[models.Continent](ctx, s.Client, s.DB, "core/continents")
 }
 
 // ScrapeCountries fetches all pages of countries and upserts into DB.
-func (s *CoreScraper) ScrapeCountries() (int, error) {
-	return scrapeCoreEntity[models.Country](s.Client, s.DB, "core/countries")
+func (s *CoreScraper) ScrapeCountries(ctx context.Context) (int, error) {
+	return scrapeCoreEntity[models.Country](ctx, s.Client, s.DB, "core/countries")
 }
 
 // ScrapeRegions fetches all pages of regions and upserts into DB.
-func (s *CoreScraper) ScrapeRegions() (int, error) {
-	return scrapeCoreEntity[models.Region](s.Client, s.DB, "core/regions")
+func (s *CoreScraper) ScrapeRegions(ctx context.Context) (int, error) {
+	return scrapeCoreEntity[models.Region](ctx, s.Client, s.DB, "core/regions")
 }
 
 // ScrapeCities fetches all pages of cities and upserts into DB.
-func (s *CoreScraper) ScrapeCities() (int, error) {
-	return scrapeCoreEntity[models.City](s.Client, s.DB, "core/cities")
+func (s *CoreScraper) ScrapeCities(ctx context.Context) (int, error) {
+	return scrapeCoreEntity[models.City](ctx, s.Client, s.DB, "core/cities")
 }
 
 // ScrapeTypes fetches all pages of types and upserts into DB.
-func (s *CoreScraper) ScrapeTypes() (int, error) {
-	return scrapeCoreEntity[models.Type](s.Client, s.DB, "core/types")
+func (s *CoreScraper) ScrapeTypes(ctx context.Context) (int, error) {
+	return scrapeCoreEntity[models.Type](ctx, s.Client, s.DB, "core/types")
 }
