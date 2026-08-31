@@ -24,6 +24,7 @@ func SetupRoutes(e *echo.Echo, h *handlers.NewsHandler, smh *handlers.Sportmonks
 	if ph != nil {
 		portal := e.Group("/portal")
 		portal.GET("/leagues", ph.GetLeagues)
+		portal.POST("/leagues/:id/status", ph.UpdateLeagueStatus)
 		portal.GET("/leagues/:league_id/seasons", ph.GetLeagueSeasons)
 		portal.GET("/seasons/:season_id/overview", ph.GetSeasonOverview)
 		portal.GET("/seasons/:season_id/standings", ph.GetSeasonStandings)

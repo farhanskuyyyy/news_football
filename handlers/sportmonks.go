@@ -41,6 +41,13 @@ func (h *SportmonksHandler) runAsync(name string, fn func(ctx context.Context)) 
 	go func() {
 		defer h.jobs.Delete(name)
 		defer cancel()
+		// Recover so a panic inside a scrape (bad insert, nil deref, etc.) is
+		// logged and the job is cleaned up instead of crashing the whole server.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Scrape] job '%s' PANIC recovered: %v", name, r)
+			}
+		}()
 		log.Printf("[Scrape] job '%s' started", name)
 		fn(ctx)
 		log.Printf("[Scrape] job '%s' finished", name)
@@ -95,8 +102,9 @@ func (h *SportmonksHandler) ScrapeCoreData(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "scraper is not initialized")
 	}
 
+	force := c.QueryParam("force") == "true" || c.QueryParam("force") == "1"
 	started := h.runAsync("core", func(ctx context.Context) {
-		if _, err := h.Scraper.ScrapeAll(ctx); err != nil {
+		if _, err := h.Scraper.ScrapeAll(ctx, force); err != nil {
 			log.Printf("[Scrape] core error: %v", err)
 		}
 	})
@@ -125,8 +133,10 @@ func (h *SportmonksHandler) ScrapeFootballData(c echo.Context) error {
 	}
 
 	force := c.QueryParam("force") == "true" || c.QueryParam("force") == "1"
+	leagueID, _ := strconv.Atoi(c.QueryParam("league_id"))
+	seasonID, _ := strconv.Atoi(c.QueryParam("season_id"))
 	started := h.runAsync("football", func(ctx context.Context) {
-		if _, err := h.FootballScraper.ScrapeAllFootball(ctx, force); err != nil {
+		if _, err := h.FootballScraper.ScrapeAllFootball(ctx, force, uint(leagueID), uint(seasonID)); err != nil {
 			log.Printf("[Scrape] football error: %v", err)
 		}
 	})

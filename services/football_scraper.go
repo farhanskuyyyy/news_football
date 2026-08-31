@@ -188,16 +188,22 @@ func (s *FootballScraper) GetCurrentSeasonIDs(activeLeagueIDs map[uint]bool, spe
 }
 
 // extractCursor parses a cursor token if raw is a full URL.
+// extractCursor returns the cursor token to use for the next page.
+//   - A full URL: return its `cursor=` query value if present, otherwise "" so
+//     the caller falls back to page-based paging (page++). Returning the whole
+//     URL as a cursor makes Sportmonks re-serve page 1 forever (infinite loop).
+//   - A bare token (not a URL): it already IS the cursor, return as-is.
 func extractCursor(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	if strings.Contains(raw, "cursor=") {
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
 		if u, err := url.Parse(raw); err == nil {
 			if c := u.Query().Get("cursor"); c != "" {
 				return c
 			}
 		}
+		return "" // page-based next_page URL → use page++ instead
 	}
 	return raw
 }
@@ -206,9 +212,19 @@ func extractCursor(raw string) string {
 func (s *FootballScraper) ScrapeLeagues(ctx context.Context) (int, error) {
 	count, err := scrapePaginated(ctx, s.Client, s.DB, "football/leagues", nil, func(data []models.League) (int, error) {
 		for i := range data {
-			data[i].Status = true
+			data[i].Status = true // default enabled on first insert
 		}
-		err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&data, dbBatchSize).Error
+		// On conflict, update every column EXCEPT `status` so admin's
+		// enable/disable choice (managed via the CMS) is preserved across
+		// re-scrapes. New leagues still get status=true on insert.
+		err := s.DB.Clauses(clause.OnConflict{
+			Columns: []clause.Column{{Name: "id"}},
+			DoUpdates: clause.AssignmentColumns([]string{
+				"sport_id", "country_id", "name", "active", "short_code",
+				"image_path", "type", "sub_type", "last_played_at", "category",
+				"has_jerseys", "updated_at",
+			}),
+		}).CreateInBatches(&data, dbBatchSize).Error
 		return len(data), err
 	})
 	s.MarkSynced("leagues", count, TTLLeagues, err)
@@ -217,19 +233,28 @@ func (s *FootballScraper) ScrapeLeagues(ctx context.Context) (int, error) {
 
 // ScrapeAllFootball orchestrates scraping across all football sub-entities and pivot tables.
 // By default it only syncs tables whose TTL has expired, and strictly targets the CURRENT season.
-func (s *FootballScraper) ScrapeAllFootball(ctx context.Context, force ...bool) (*FootballScrapeResult, error) {
-	isForce := len(force) > 0 && force[0]
+// ScrapeAllFootball scrapes football data. leagueID > 0 restricts to that single
+// league (regardless of its active flag, as long as it exists); 0 = all
+// status+active leagues. seasonID > 0 restricts to that one season; 0 = current
+// seasons of the targeted league(s).
+func (s *FootballScraper) ScrapeAllFootball(ctx context.Context, isForce bool, leagueID uint, seasonID uint) (*FootballScrapeResult, error) {
 	result := &FootballScrapeResult{}
 
-	// Query active leagues from DB (status = true AND active = true)
+	// Query target leagues from DB.
 	var activeLeagues []models.League
-	if err := s.DB.Where("status = ? AND active = ?", true, true).Find(&activeLeagues).Error; err != nil {
-		return nil, fmt.Errorf("failed to query active leagues from database: %w", err)
+	q := s.DB
+	if leagueID > 0 {
+		q = q.Where("id = ?", leagueID)
+	} else {
+		q = q.Where("status = ? AND active = ?", true, true)
+	}
+	if err := q.Find(&activeLeagues).Error; err != nil {
+		return nil, fmt.Errorf("failed to query leagues from database: %w", err)
 	}
 
 	result.ActiveLeaguesCount = len(activeLeagues)
 	if len(activeLeagues) == 0 {
-		log.Println("[FootballScraper] No active leagues found (status = true AND active = true). Run /sportmonks/scrape/leagues first or set status = true.")
+		log.Println("[FootballScraper] No target leagues found. Run /sportmonks/scrape/leagues first or enable a league.")
 		return result, nil
 	}
 
@@ -237,7 +262,7 @@ func (s *FootballScraper) ScrapeAllFootball(ctx context.Context, force ...bool) 
 	for _, l := range activeLeagues {
 		activeLeagueIDs[l.ID] = true
 	}
-	log.Printf("[FootballScraper] Scraping data for %d active leagues (Force: %v)", len(activeLeagues), isForce)
+	log.Printf("[FootballScraper] Scraping %d league(s) (league_id=%d, season_id=%d, force=%v)", len(activeLeagues), leagueID, seasonID, isForce)
 
 	var err error
 
@@ -253,9 +278,15 @@ func (s *FootballScraper) ScrapeAllFootball(ctx context.Context, force ...bool) 
 		return result, ctx.Err()
 	}
 
-	// Resolve Current Season IDs for downstream filtering
-	currentSeasonIDs := s.GetCurrentSeasonIDs(activeLeagueIDs)
-	log.Printf("[FootballScraper] Target current seasons: %d active seasons", len(currentSeasonIDs))
+	// Resolve target season IDs for downstream filtering. A specific seasonID
+	// overrides the "current seasons" resolution.
+	var currentSeasonIDs map[uint]bool
+	if seasonID > 0 {
+		currentSeasonIDs = s.GetCurrentSeasonIDs(activeLeagueIDs, seasonID)
+	} else {
+		currentSeasonIDs = s.GetCurrentSeasonIDs(activeLeagueIDs)
+	}
+	log.Printf("[FootballScraper] Target seasons: %d", len(currentSeasonIDs))
 
 	// 2. Stages (TTL: 24h, filtered by current seasons)
 	if s.ShouldSync("stages", TTLStages, isForce) {
@@ -862,8 +893,23 @@ func (s *FootballScraper) ScrapeFixtures(ctx context.Context, activeLeagueIDs ma
 		targetSeasons = currentSeasonIDs[0]
 	}
 
+	// Server-side filter to target seasons. Without this, football/fixtures
+	// paginates the ENTIRE global fixture history (millions of rows) and never
+	// finishes.
+	var seasonIDStrs []string
+	for id := range targetSeasons {
+		if id > 0 {
+			seasonIDStrs = append(seasonIDStrs, strconv.Itoa(int(id)))
+		}
+	}
+	if len(seasonIDStrs) == 0 {
+		log.Println("[FootballScraper] ScrapeFixtures: no target seasons resolved, skipping (would otherwise scrape ALL global fixtures).")
+		return 0, nil
+	}
+
 	extraParams := map[string]string{
 		"include": "events;lineups.details;scores;statistics;referees;participants",
+		"filters": "fixtureSeasons:" + strings.Join(seasonIDStrs, ","),
 	}
 
 	return scrapePaginated(ctx, s.Client, s.DB, "football/fixtures", extraParams, func(data []FixturePayload) (int, error) {
@@ -1765,10 +1811,19 @@ func scrapePaginated[T any](ctx context.Context, client *SportmonksClient, db *g
 	var total int
 	page := 1
 	var cursor string
+	iterations := 0
 
 	for {
 		if err := ctx.Err(); err != nil {
 			return total, err
+		}
+
+		// Safety valve against a runaway pagination loop (e.g. a bad cursor that
+		// never advances). 20000 pages is far beyond any real endpoint.
+		iterations++
+		if iterations > 20000 {
+			log.Printf("[Scraper] %s: aborting after %d iterations (possible pagination loop)", endpoint, iterations)
+			return total, fmt.Errorf("%s: pagination exceeded %d iterations", endpoint, iterations)
 		}
 
 		params := make(map[string]string)

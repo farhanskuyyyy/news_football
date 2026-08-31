@@ -112,7 +112,7 @@ func TestFootballScraper(t *testing.T) {
 	}
 
 	// Step 2: Scrape Football for Active Leagues (where status = true AND active = true)
-	result, err := scraper.ScrapeAllFootball(context.Background())
+	result, err := scraper.ScrapeAllFootball(context.Background(), false, 0, 0)
 	if err != nil {
 		t.Fatalf("unexpected error scraping football: %v", err)
 	}
