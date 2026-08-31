@@ -1,8 +1,11 @@
 package handlers
 
 import (
+	"context"
+	"log"
 	"net/http"
 	"strconv"
+	"sync"
 
 	"github.com/farhanarfianto/apigo-docker/database"
 	"github.com/farhanarfianto/apigo-docker/models"
@@ -14,6 +17,8 @@ type SportmonksHandler struct {
 	Client          *services.SportmonksClient
 	Scraper         *services.CoreScraper
 	FootballScraper *services.FootballScraper
+
+	jobs sync.Map // jobName -> context.CancelFunc while a background scrape is running
 }
 
 func NewSportmonksHandler(client *services.SportmonksClient, scraper *services.CoreScraper, footballScraper *services.FootballScraper) *SportmonksHandler {
@@ -24,21 +29,86 @@ func NewSportmonksHandler(client *services.SportmonksClient, scraper *services.C
 	}
 }
 
+// runAsync starts fn in the background under a named lock so the same job can't
+// run twice concurrently. The job's cancel func is stored so it can be stopped
+// via StopScrapeJob. Returns false if the job is already running.
+func (h *SportmonksHandler) runAsync(name string, fn func(ctx context.Context)) bool {
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, busy := h.jobs.LoadOrStore(name, cancel); busy {
+		cancel()
+		return false
+	}
+	go func() {
+		defer h.jobs.Delete(name)
+		defer cancel()
+		// Recover so a panic inside a scrape (bad insert, nil deref, etc.) is
+		// logged and the job is cleaned up instead of crashing the whole server.
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("[Scrape] job '%s' PANIC recovered: %v", name, r)
+			}
+		}()
+		log.Printf("[Scrape] job '%s' started", name)
+		fn(ctx)
+		log.Printf("[Scrape] job '%s' finished", name)
+	}()
+	return true
+}
+
+// StopScrapeJob cancels a running background scrape by name.
+func (h *SportmonksHandler) StopScrapeJob(c echo.Context) error {
+	name := c.Param("job")
+	v, ok := h.jobs.Load(name)
+	if !ok {
+		return c.JSON(http.StatusNotFound, echo.Map{"status": "not_running", "job": name})
+	}
+	if cancel, ok := v.(context.CancelFunc); ok {
+		cancel()
+	}
+	return c.JSON(http.StatusOK, echo.Map{"status": "stopping", "job": name})
+}
+
+// ListScrapeJobs returns the names of currently running background scrapes.
+func (h *SportmonksHandler) ListScrapeJobs(c echo.Context) error {
+	var running []string
+	h.jobs.Range(func(k, _ any) bool {
+		if name, ok := k.(string); ok {
+			running = append(running, name)
+		}
+		return true
+	})
+	return c.JSON(http.StatusOK, echo.Map{"running": running})
+}
+
+// asyncResponse returns a 202 (or 409 if already running) for a background job.
+func asyncResponse(c echo.Context, name string, started bool) error {
+	if !started {
+		return c.JSON(http.StatusConflict, echo.Map{
+			"status": "already_running",
+			"job":    name,
+			"hint":   "cek progress di GET /sportmonks/sync/status",
+		})
+	}
+	return c.JSON(http.StatusAccepted, echo.Map{
+		"status": "started",
+		"job":    name,
+		"hint":   "berjalan di background — cek GET /sportmonks/sync/status",
+	})
+}
+
 // ScrapeCoreData triggers fetching and saving all Core entities (Continents, Countries, Regions, Cities, Types) into DB.
 func (h *SportmonksHandler) ScrapeCoreData(c echo.Context) error {
 	if h.Scraper == nil {
 		return echo.NewHTTPError(http.StatusInternalServerError, "scraper is not initialized")
 	}
 
-	result, err := h.Scraper.ScrapeAll()
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
-	return c.JSON(http.StatusOK, echo.Map{
-		"status":  "success",
-		"scraped": result,
+	force := c.QueryParam("force") == "true" || c.QueryParam("force") == "1"
+	started := h.runAsync("core", func(ctx context.Context) {
+		if _, err := h.Scraper.ScrapeAll(ctx, force); err != nil {
+			log.Printf("[Scrape] core error: %v", err)
+		}
 	})
+	return asyncResponse(c, "core", started)
 }
 
 // ScrapeLeaguesData triggers fetching and saving all Leagues into DB.
@@ -47,15 +117,12 @@ func (h *SportmonksHandler) ScrapeLeaguesData(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
 	}
 
-	count, err := h.FootballScraper.ScrapeLeagues()
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
-	return c.JSON(http.StatusOK, echo.Map{
-		"status":  "success",
-		"scraped": echo.Map{"leagues": count},
+	started := h.runAsync("leagues", func(ctx context.Context) {
+		if _, err := h.FootballScraper.ScrapeLeagues(ctx); err != nil {
+			log.Printf("[Scrape] leagues error: %v", err)
+		}
 	})
+	return asyncResponse(c, "leagues", started)
 }
 
 // ScrapeFootballData triggers fetching and saving all Football entities into DB.
@@ -66,16 +133,14 @@ func (h *SportmonksHandler) ScrapeFootballData(c echo.Context) error {
 	}
 
 	force := c.QueryParam("force") == "true" || c.QueryParam("force") == "1"
-	result, err := h.FootballScraper.ScrapeAllFootball(force)
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
-	return c.JSON(http.StatusOK, echo.Map{
-		"status":  "success",
-		"force":   force,
-		"scraped": result,
+	leagueID, _ := strconv.Atoi(c.QueryParam("league_id"))
+	seasonID, _ := strconv.Atoi(c.QueryParam("season_id"))
+	started := h.runAsync("football", func(ctx context.Context) {
+		if _, err := h.FootballScraper.ScrapeAllFootball(ctx, force, uint(leagueID), uint(seasonID)); err != nil {
+			log.Printf("[Scrape] football error: %v", err)
+		}
 	})
+	return asyncResponse(c, "football", started)
 }
 
 // GetSyncStatus returns the synchronization tracker status for all tables.
@@ -92,16 +157,12 @@ func (h *SportmonksHandler) ScrapeFixtureDetailsData(c echo.Context) error {
 	limit, _ := strconv.Atoi(c.QueryParam("limit"))
 	seasonID, _ := strconv.Atoi(c.QueryParam("season_id"))
 
-	result, err := h.FootballScraper.ScrapeFixtureDetails(limit, force, uint(seasonID))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
-	return c.JSON(http.StatusOK, echo.Map{
-		"status":  "success",
-		"force":   force,
-		"scraped": result,
+	started := h.runAsync("fixture-details", func(ctx context.Context) {
+		if _, err := h.FootballScraper.ScrapeFixtureDetails(ctx, limit, force, uint(seasonID)); err != nil {
+			log.Printf("[Scrape] fixture-details error: %v", err)
+		}
 	})
+	return asyncResponse(c, "fixture-details", started)
 }
 
 // ScrapePlayerStatisticsData triggers player season-statistics scraping for
@@ -113,15 +174,29 @@ func (h *SportmonksHandler) ScrapePlayerStatisticsData(c echo.Context) error {
 	}
 
 	seasonID, _ := strconv.Atoi(c.QueryParam("season_id"))
-	count, err := h.FootballScraper.ScrapePlayerStatisticsInit(uint(seasonID))
-	if err != nil {
-		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
-	}
-
-	return c.JSON(http.StatusOK, echo.Map{
-		"status":  "success",
-		"scraped": echo.Map{"player_statistics": count},
+	started := h.runAsync("player-statistics", func(ctx context.Context) {
+		if _, err := h.FootballScraper.ScrapePlayerStatisticsInit(ctx, uint(seasonID)); err != nil {
+			log.Printf("[Scrape] player-statistics error: %v", err)
+		}
 	})
+	return asyncResponse(c, "player-statistics", started)
+}
+
+// ScrapeSingleFixtureData fetches ONE fixture on demand (with all match-center
+// data) and saves it. Used when a fixture detail page is opened for a fixture
+// not yet in the DB.
+func (h *SportmonksHandler) ScrapeSingleFixtureData(c echo.Context) error {
+	if h.FootballScraper == nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, "football scraper is not initialized")
+	}
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil || id <= 0 {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid fixture id")
+	}
+	if err := h.FootballScraper.ScrapeSingleFixture(uint(id)); err != nil {
+		return echo.NewHTTPError(http.StatusBadGateway, err.Error())
+	}
+	return c.JSON(http.StatusOK, echo.Map{"status": "success", "fixture_id": id})
 }
 
 func (h *SportmonksHandler) GetSyncStatus(c echo.Context) error {

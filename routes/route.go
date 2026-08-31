@@ -24,6 +24,7 @@ func SetupRoutes(e *echo.Echo, h *handlers.NewsHandler, smh *handlers.Sportmonks
 	if ph != nil {
 		portal := e.Group("/portal")
 		portal.GET("/leagues", ph.GetLeagues)
+		portal.POST("/leagues/:id/status", ph.UpdateLeagueStatus)
 		portal.GET("/leagues/:league_id/seasons", ph.GetLeagueSeasons)
 		portal.GET("/seasons/:season_id/overview", ph.GetSeasonOverview)
 		portal.GET("/seasons/:season_id/standings", ph.GetSeasonStandings)
@@ -63,6 +64,9 @@ func SetupRoutes(e *echo.Echo, h *handlers.NewsHandler, smh *handlers.Sportmonks
 		sm.POST("/scrape/leagues", smh.ScrapeLeaguesData)
 		sm.POST("/scrape/football", smh.ScrapeFootballData)
 		sm.POST("/scrape/fixture-details", smh.ScrapeFixtureDetailsData)
+		sm.POST("/scrape/fixture/:id", smh.ScrapeSingleFixtureData)
+		sm.POST("/scrape/stop/:job", smh.StopScrapeJob)
+		sm.GET("/scrape/jobs", smh.ListScrapeJobs)
 		sm.POST("/scrape/player-statistics", smh.ScrapePlayerStatisticsData)
 		sm.GET("/sync/status", smh.GetSyncStatus)
 		sm.POST("/sync/seed", smh.SeedSyncTablesHandler)

@@ -31,6 +31,43 @@ type LeagueListItem struct {
 }
 
 // GetLeagues returns all leagues from DB, ordered by active and status.
+// UpdateLeagueStatus enables/disables a league for scraping (the `status` flag).
+// Accepts ?status=true|false or a JSON body {"status":bool}.
+func (h *PortalHandler) UpdateLeagueStatus(c echo.Context) error {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid league id")
+	}
+
+	// Accept status from query, form, or JSON body (robust across content types).
+	var status bool
+	if q := c.QueryParam("status"); q != "" {
+		status = q == "true" || q == "1"
+	} else if f := c.FormValue("status"); f != "" {
+		status = f == "true" || f == "1"
+	} else {
+		var body struct {
+			Status bool `json:"status" form:"status"`
+		}
+		_ = c.Bind(&body)
+		status = body.Status
+	}
+
+	res := h.DB.Model(&models.League{}).Where("id = ?", id).Update("status", status)
+	if res.Error != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, res.Error.Error())
+	}
+	if res.RowsAffected == 0 {
+		return echo.NewHTTPError(http.StatusNotFound, "league not found")
+	}
+
+	return c.JSON(http.StatusOK, echo.Map{
+		"status":    "success",
+		"league_id": id,
+		"enabled":   status,
+	})
+}
+
 func (h *PortalHandler) GetLeagues(c echo.Context) error {
 	var leagues []models.League
 	query := h.DB.Order("status DESC, active DESC, name ASC")
