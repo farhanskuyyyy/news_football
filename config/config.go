@@ -15,6 +15,8 @@ type Config struct {
 	SportmonksBaseURL  string
 	SportmonksAPIToken string
 	RefreshToken       string
+	CronEnabled        bool
+	CronInterval       string
 }
 
 func Load() *Config {
@@ -31,6 +33,8 @@ func Load() *Config {
 		SportmonksBaseURL:  getEnv("SPORTMONKS_BASE_URL", "https://api.sportmonks.com/v3"),
 		SportmonksAPIToken: getEnv("SPORTMONKS_API_TOKEN", ""),
 		RefreshToken:       getEnv("REFRESH_TOKEN", ""),
+		CronEnabled:        getEnv("SCRAPE_CRON_ENABLED", "true") == "true",
+		CronInterval:       getEnv("SCRAPE_CRON_INTERVAL", "30m"),
 	}
 }
 
