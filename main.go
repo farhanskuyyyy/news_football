@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 
 	"github.com/farhanarfianto/apigo-docker/config"
@@ -36,6 +37,13 @@ func main() {
 
 	// Register routes
 	routes.SetupRoutes(e, h, smh, ph)
+
+	// Background auto-scrape scheduler (TTL-gated). Toggle via SCRAPE_CRON_ENABLED.
+	if cfg.CronEnabled {
+		services.NewScheduler(footballScraper, cfg.CronInterval).Start(context.Background())
+	} else {
+		log.Println("[Scheduler] auto-scrape disabled (SCRAPE_CRON_ENABLED=false)")
+	}
 
 	e.Logger.Fatal(e.Start(":" + cfg.Port))
 }
