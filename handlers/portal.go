@@ -20,6 +20,10 @@ func NewPortalHandler(db *gorm.DB) *PortalHandler {
 	return &PortalHandler{DB: db}
 }
 
+// goalTopscorerTypeID is the Sportmonks type id for the "Goal Topscorer"
+// ranking, used as the default topscorer metric.
+const goalTopscorerTypeID = uint(208)
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. LEAGUES & SEASONS
 // ─────────────────────────────────────────────────────────────────────────────
@@ -72,8 +76,10 @@ func (h *PortalHandler) GetLeagues(c echo.Context) error {
 	var leagues []models.League
 	query := h.DB.Order("status DESC, active DESC, name ASC")
 
+	// The admin `status` flag is the sole gate for public visibility; the
+	// Sportmonks `active` column is informational only.
 	if c.QueryParam("active_only") == "true" {
-		query = query.Where("status = ? AND active = ?", true, true)
+		query = query.Where("status = ?", true)
 	}
 
 	if err := query.Find(&leagues).Error; err != nil {
@@ -1588,8 +1594,16 @@ func (h *PortalHandler) GetSeasonTopscorers(c echo.Context) error {
 		}
 	}
 
+	// Default to the goals ranking when it exists — otherwise the lowest
+	// type id wins, which is usually a cards ranking (83/84) rather than goals.
 	if selectedTypeID == 0 && len(distinctTypeIDs) > 0 {
 		selectedTypeID = distinctTypeIDs[0]
+		for _, tid := range distinctTypeIDs {
+			if tid == goalTopscorerTypeID {
+				selectedTypeID = tid
+				break
+			}
+		}
 	}
 
 	// 2. Query topscorers for the selected type
