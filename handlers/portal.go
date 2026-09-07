@@ -155,6 +155,17 @@ func (h *PortalHandler) GetSeasonOverview(c echo.Context) error {
 	var totalRounds int64
 	h.DB.Model(&models.Round{}).Where("season_id = ?", seasonID).Count(&totalRounds)
 
+	var totalStages int64
+	h.DB.Model(&models.Stage{}).Where("season_id = ?", seasonID).Count(&totalStages)
+
+	// A season is a cup when it is played in ties somewhere — qualifying or
+	// knock-out stages. That, not the presence of a group stage, is what makes
+	// the bracket view meaningful: every league has exactly one group stage.
+	var bracketStages int64
+	h.DB.Model(&models.Stage{}).
+		Where("season_id = ? AND type_id IN ?", seasonID, []uint{knockOutStageTypeID, qualifyingStageTypeID}).
+		Count(&bracketStages)
+
 	return c.JSON(http.StatusOK, echo.Map{
 		"status": "success",
 		"data": echo.Map{
@@ -163,6 +174,8 @@ func (h *PortalHandler) GetSeasonOverview(c echo.Context) error {
 			"total_teams":    totalTeams,
 			"total_fixtures": totalFixtures,
 			"total_rounds":   totalRounds,
+			"total_stages":   totalStages,
+			"has_bracket":    bracketStages > 0,
 		},
 	})
 }
@@ -207,6 +220,16 @@ func (h *PortalHandler) GetSeasonStandings(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
+	return c.JSON(http.StatusOK, echo.Map{
+		"status": "success",
+		"data":   h.buildStandingItems(standings),
+	})
+}
+
+// buildStandingItems enriches raw standing rows with team, per-metric details
+// (P/W/D/L/GF/GA/GD) and recent form. Shared by the standings tab and the
+// cup bracket, which renders the same table for its group/league stages.
+func (h *PortalHandler) buildStandingItems(standings []models.Standing) []StandingItem {
 	var standingIDs []uint
 	for _, st := range standings {
 		standingIDs = append(standingIDs, st.ID)
@@ -278,7 +301,7 @@ func (h *PortalHandler) GetSeasonStandings(c echo.Context) error {
 		})
 	}
 
-	var items []StandingItem
+	items := make([]StandingItem, 0, len(standings))
 	for _, st := range standings {
 		var tm models.Team
 		if st.ParticipantID > 0 {
@@ -367,10 +390,415 @@ func (h *PortalHandler) GetSeasonStandings(c echo.Context) error {
 		})
 	}
 
+	return items
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 2b. CUP BRACKET (STAGES)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Sportmonks stage type ids. A season counts as a cup when it has at least one
+// qualifying or knock-out stage: every league — domestic ones included — has a
+// single GROUP_STAGE, so that type alone cannot tell a cup from a league.
+const (
+	groupStageTypeID      = uint(223)
+	knockOutStageTypeID   = uint(224)
+	qualifyingStageTypeID = uint(225)
+)
+
+// isBracketStageType reports whether a stage is played as ties (one or two
+// legs) rather than as a table.
+func isBracketStageType(typeID *uint) bool {
+	return typeID != nil && (*typeID == knockOutStageTypeID || *typeID == qualifyingStageTypeID)
+}
+
+// BracketLeg is one fixture of a tie.
+type BracketLeg struct {
+	FixtureID  uint          `json:"fixture_id"`
+	Name       string        `json:"name"`
+	StartingAt *string       `json:"starting_at"`
+	StateID    *uint         `json:"state_id"`
+	State      *models.State `json:"state,omitempty"`
+	HomeTeamID uint          `json:"home_team_id"`
+	AwayTeamID uint          `json:"away_team_id"`
+	HomeGoals  *int          `json:"home_goals"`
+	AwayGoals  *int          `json:"away_goals"`
+	ResultInfo *string       `json:"result_info"`
+}
+
+// BracketSide is one team in a tie, with its aggregate over the legs played.
+type BracketSide struct {
+	Team      *models.Team `json:"team,omitempty"`
+	TeamID    uint         `json:"team_id"`
+	Aggregate int          `json:"aggregate"`
+}
+
+// BracketTie pairs the legs two teams played against each other inside one stage.
+type BracketTie struct {
+	// ID is the lowest fixture id of the tie — stable, and enough for the UI to
+	// wire a tie to the one it feeds.
+	ID        uint          `json:"id"`
+	NextTieID *uint         `json:"next_tie_id"`
+	Sides     []BracketSide `json:"sides"`
+	Legs      []BracketLeg  `json:"legs"`
+	// WinnerTeamID is set only when the aggregate decides the tie. A level
+	// aggregate leaves it nil — the shootout/extra-time outcome is not stored
+	// as data, only described in the last leg's ResultInfo.
+	WinnerTeamID *uint   `json:"winner_team_id"`
+	DecidedBy    string  `json:"decided_by"` // "aggregate" | "level" | "pending"
+	ResultInfo   *string `json:"result_info"`
+	Played       bool    `json:"played"`
+}
+
+// BracketStage is one stage of a season, rendered either as ties or as a table.
+type BracketStage struct {
+	models.Stage
+	TypeName string `json:"type_name"`
+	Kind     string `json:"kind"` // "bracket" | "table"
+	// IsKnockout marks the stages that form the elimination tree. Qualifying
+	// rounds are ties too, but new entrants join each round, so they do not
+	// chain into a bracket and are listed rather than drawn.
+	IsKnockout bool           `json:"is_knockout"`
+	Ties       []BracketTie   `json:"ties"`
+	Standings  []StandingItem `json:"standings"`
+}
+
+// GetSeasonBracket returns a season's stages in playing order: knock-out and
+// qualifying stages as ties (legs paired by the two teams involved, with
+// aggregate scores), every other stage as its standings table.
+func (h *PortalHandler) GetSeasonBracket(c echo.Context) error {
+	seasonID, err := strconv.Atoi(c.Param("season_id"))
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, "invalid season id")
+	}
+
+	var stages []models.Stage
+	if err := h.DB.Where("season_id = ?", seasonID).
+		Order("sort_order ASC, id ASC").
+		Find(&stages).Error; err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	typeNames := h.stageTypeNames(stages)
+	teamCache := make(map[uint]*models.Team)
+
+	items := make([]BracketStage, 0, len(stages))
+	for _, st := range stages {
+		item := BracketStage{
+			Stage:     st,
+			Ties:      []BracketTie{},
+			Standings: []StandingItem{},
+			Kind:      "table",
+		}
+		if st.TypeID != nil {
+			item.TypeName = typeNames[*st.TypeID]
+		}
+
+		if isBracketStageType(st.TypeID) {
+			item.Kind = "bracket"
+			item.IsKnockout = st.TypeID != nil && *st.TypeID == knockOutStageTypeID
+			ties, err := h.buildStageTies(st.ID, teamCache)
+			if err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+			}
+			item.Ties = ties
+		} else {
+			var standings []models.Standing
+			if err := h.DB.Where("stage_id = ?", st.ID).
+				Order("position ASC").
+				Find(&standings).Error; err != nil {
+				return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+			}
+			item.Standings = h.buildStandingItems(standings)
+		}
+
+		items = append(items, item)
+	}
+
+	linkKnockoutTree(items)
+
 	return c.JSON(http.StatusOK, echo.Map{
 		"status": "success",
 		"data":   items,
 	})
+}
+
+// linkKnockoutTree wires each knock-out tie to the tie its winner plays next,
+// then reorders every round so the ties feeding the same later tie sit next to
+// each other — which is what lets the UI draw the rounds as a tree instead of
+// as unrelated columns.
+//
+// Both steps are derived from who actually plays whom: the winner of a tie
+// turns up in exactly one tie of the following round. Sportmonks stores no
+// parent/child link, so nothing here is assumed about seeding or bracket shape.
+func linkKnockoutTree(stages []BracketStage) {
+	// Collect the knock-out rounds, in playing order.
+	var rounds []*BracketStage
+	for i := range stages {
+		if stages[i].IsKnockout {
+			rounds = append(rounds, &stages[i])
+		}
+	}
+	if len(rounds) < 2 {
+		return
+	}
+
+	// Link every round to the next one.
+	for i := 0; i < len(rounds)-1; i++ {
+		next := rounds[i+1]
+		tieByTeam := make(map[uint]uint) // team id -> tie id in the next round
+		for _, t := range next.Ties {
+			for _, side := range t.Sides {
+				tieByTeam[side.TeamID] = t.ID
+			}
+		}
+
+		for j := range rounds[i].Ties {
+			tie := &rounds[i].Ties[j]
+			if tie.WinnerTeamID == nil {
+				continue
+			}
+			if nextID, ok := tieByTeam[*tie.WinnerTeamID]; ok {
+				id := nextID
+				tie.NextTieID = &id
+			}
+		}
+	}
+
+	// Walking backwards, sort each round by where its ties land in the next one.
+	for i := len(rounds) - 2; i >= 0; i-- {
+		position := make(map[uint]int, len(rounds[i+1].Ties))
+		for idx, t := range rounds[i+1].Ties {
+			position[t.ID] = idx
+		}
+
+		ties := rounds[i].Ties
+		sort.SliceStable(ties, func(a, b int) bool {
+			pa, oka := tiePosition(ties[a], position)
+			pb, okb := tiePosition(ties[b], position)
+			if oka != okb {
+				return oka // ties that feed a known later tie come first
+			}
+			return pa < pb
+		})
+	}
+}
+
+// tiePosition reports where a tie's winner continues in the next round.
+func tiePosition(tie BracketTie, position map[uint]int) (int, bool) {
+	if tie.NextTieID == nil {
+		return 1 << 30, false
+	}
+	pos, ok := position[*tie.NextTieID]
+	if !ok {
+		return 1 << 30, false
+	}
+	return pos, true
+}
+
+// stageTypeNames resolves the stage type ids in one query.
+func (h *PortalHandler) stageTypeNames(stages []models.Stage) map[uint]string {
+	names := make(map[uint]string)
+	var ids []uint
+	for _, st := range stages {
+		if st.TypeID != nil {
+			ids = append(ids, *st.TypeID)
+		}
+	}
+	if len(ids) == 0 {
+		return names
+	}
+
+	var types []models.Type
+	h.DB.Where("id IN ?", ids).Find(&types)
+	for _, t := range types {
+		name := t.Name
+		if name == "" {
+			name = t.DeveloperName
+		}
+		names[t.ID] = name
+	}
+	return names
+}
+
+// buildStageTies groups a stage's fixtures into ties. Two fixtures belong to the
+// same tie when they are between the same two teams, whichever side was at home,
+// which is how a two-legged round is represented in the fixture list.
+func (h *PortalHandler) buildStageTies(stageID uint, teamCache map[uint]*models.Team) ([]BracketTie, error) {
+	var fixtures []models.Fixture
+	if err := h.DB.Where("stage_id = ?", stageID).
+		Preload("State").
+		Order("starting_at ASC, id ASC").
+		Find(&fixtures).Error; err != nil {
+		return nil, err
+	}
+	if len(fixtures) == 0 {
+		return []BracketTie{}, nil
+	}
+
+	fixtureIDs := make([]uint, 0, len(fixtures))
+	for _, f := range fixtures {
+		fixtureIDs = append(fixtureIDs, f.ID)
+	}
+
+	// Final score per side, keyed by fixture.
+	var scores []models.FixtureScore
+	h.DB.Where("fixture_id IN ? AND description = ?", fixtureIDs, "CURRENT").Find(&scores)
+
+	type sideScore struct {
+		teamID uint
+		goals  int
+	}
+	homeScore := make(map[uint]sideScore)
+	awayScore := make(map[uint]sideScore)
+	for _, sc := range scores {
+		switch strings.ToLower(sc.Participant) {
+		case "home":
+			homeScore[sc.FixtureID] = sideScore{teamID: sc.ParticipantID, goals: sc.Goals}
+		case "away":
+			awayScore[sc.FixtureID] = sideScore{teamID: sc.ParticipantID, goals: sc.Goals}
+		}
+	}
+
+	// Group legs by the unordered pair of teams.
+	type tieBuild struct {
+		key       string
+		order     []uint // team ids, in the order first seen
+		aggregate map[uint]int
+		legs      []BracketLeg
+	}
+	byKey := make(map[string]*tieBuild)
+	var keyOrder []string
+
+	for _, f := range fixtures {
+		home, hasHome := homeScore[f.ID]
+		away, hasAway := awayScore[f.ID]
+		if !hasHome || !hasAway || home.teamID == 0 || away.teamID == 0 {
+			// Without both participants the fixture cannot be paired into a tie.
+			continue
+		}
+
+		lo, hi := home.teamID, away.teamID
+		if lo > hi {
+			lo, hi = hi, lo
+		}
+		key := fmt.Sprintf("%d-%d", lo, hi)
+
+		tb, ok := byKey[key]
+		if !ok {
+			tb = &tieBuild{key: key, aggregate: map[uint]int{}}
+			byKey[key] = tb
+			keyOrder = append(keyOrder, key)
+			tb.order = []uint{home.teamID, away.teamID}
+		}
+
+		played := isPlayedState(f.State)
+		if played {
+			tb.aggregate[home.teamID] += home.goals
+			tb.aggregate[away.teamID] += away.goals
+		}
+
+		leg := BracketLeg{
+			FixtureID:  f.ID,
+			Name:       f.Name,
+			StartingAt: f.StartingAt,
+			StateID:    f.StateID,
+			State:      f.State,
+			HomeTeamID: home.teamID,
+			AwayTeamID: away.teamID,
+			ResultInfo: f.ResultInfo,
+		}
+		if played {
+			hg, ag := home.goals, away.goals
+			leg.HomeGoals = &hg
+			leg.AwayGoals = &ag
+		}
+		tb.legs = append(tb.legs, leg)
+	}
+
+	ties := make([]BracketTie, 0, len(keyOrder))
+	for _, key := range keyOrder {
+		tb := byKey[key]
+
+		anyPlayed := false
+		for _, leg := range tb.legs {
+			if leg.HomeGoals != nil {
+				anyPlayed = true
+				break
+			}
+		}
+
+		sides := make([]BracketSide, 0, len(tb.order))
+		for _, teamID := range tb.order {
+			sides = append(sides, BracketSide{
+				Team:      h.teamByID(teamID, teamCache),
+				TeamID:    teamID,
+				Aggregate: tb.aggregate[teamID],
+			})
+		}
+
+		tieID := tb.legs[0].FixtureID
+		for _, leg := range tb.legs {
+			if leg.FixtureID < tieID {
+				tieID = leg.FixtureID
+			}
+		}
+
+		tie := BracketTie{
+			ID:         tieID,
+			Sides:      sides,
+			Legs:       tb.legs,
+			Played:     anyPlayed,
+			DecidedBy:  "pending",
+			ResultInfo: tb.legs[len(tb.legs)-1].ResultInfo,
+		}
+
+		if anyPlayed && len(sides) == 2 {
+			switch {
+			case sides[0].Aggregate > sides[1].Aggregate:
+				id := sides[0].TeamID
+				tie.WinnerTeamID = &id
+				tie.DecidedBy = "aggregate"
+			case sides[1].Aggregate > sides[0].Aggregate:
+				id := sides[1].TeamID
+				tie.WinnerTeamID = &id
+				tie.DecidedBy = "aggregate"
+			default:
+				// Level on aggregate: extra time / penalties settled it, and that
+				// outcome only exists as prose in the last leg's result_info.
+				tie.DecidedBy = "level"
+			}
+		}
+
+		ties = append(ties, tie)
+	}
+
+	return ties, nil
+}
+
+// isPlayedState reports whether a fixture has a final score worth aggregating.
+func isPlayedState(state *models.State) bool {
+	if state == nil {
+		return false
+	}
+	return finishedFixtureStates[strings.ToUpper(state.ShortName)]
+}
+
+// teamByID resolves a team once per request.
+func (h *PortalHandler) teamByID(id uint, cache map[uint]*models.Team) *models.Team {
+	if id == 0 {
+		return nil
+	}
+	if tm, ok := cache[id]; ok {
+		return tm
+	}
+	var tm models.Team
+	if err := h.DB.First(&tm, id).Error; err != nil {
+		cache[id] = nil
+		return nil
+	}
+	cache[id] = &tm
+	return &tm
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -439,9 +867,13 @@ type FixtureStatusItem struct {
 // Sportmonks state short names, grouped by how their fixtures should be read.
 // Anything not listed here is treated as "other": shown as-is, oldest first.
 var (
-	finishedFixtureStates = map[string]bool{"FT": true, "AET": true, "FT_PEN": true}
+	// Short names as Sportmonks actually stores them (see the `states` table):
+	// a finished-after-penalties match is "FTP", not "FT_PEN", and the halves
+	// are "1st"/"2nd" rather than "1H"/"2H". Matching invented codes silently
+	// mis-classifies fixtures — an FTP final counted as "not played".
+	finishedFixtureStates = map[string]bool{"FT": true, "AET": true, "FTP": true}
 	upcomingFixtureStates = map[string]bool{"NS": true, "TBA": true}
-	liveFixtureStates     = map[string]bool{"LIVE": true, "INPLAY": true, "1H": true, "2H": true, "HT": true, "ET": true, "PEN_LIVE": true, "BREAK": true}
+	liveFixtureStates     = map[string]bool{"1ST": true, "2ND": true, "HT": true, "BRK": true, "ET": true, "ETB": true, "2ET": true, "PEN": true, "PENB": true}
 )
 
 // statusGroupRank orders the status filter chips: live, then upcoming, then

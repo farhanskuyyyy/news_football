@@ -30,6 +30,7 @@ func SetupRoutes(e *echo.Echo, h *handlers.NewsHandler, smh *handlers.Sportmonks
 		portal.GET("/seasons/:season_id/standings", ph.GetSeasonStandings)
 		portal.GET("/seasons/:season_id/rounds", ph.GetSeasonRounds)
 		portal.GET("/seasons/:season_id/fixtures", ph.GetSeasonFixtures)
+		portal.GET("/seasons/:season_id/bracket", ph.GetSeasonBracket)
 		portal.GET("/seasons/:season_id/teams", ph.GetSeasonTeams)
 		portal.GET("/seasons/:season_id/topscorers", ph.GetSeasonTopscorers)
 		portal.GET("/seasons/:season_id/transfers", ph.GetSeasonTransfers)
