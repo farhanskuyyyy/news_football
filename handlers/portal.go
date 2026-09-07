@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/farhanarfianto/apigo-docker/models"
 	"github.com/labstack/echo/v4"
@@ -19,6 +20,10 @@ type PortalHandler struct {
 func NewPortalHandler(db *gorm.DB) *PortalHandler {
 	return &PortalHandler{DB: db}
 }
+
+// goalTopscorerTypeID is the Sportmonks type id for the "Goal Topscorer"
+// ranking, used as the default topscorer metric.
+const goalTopscorerTypeID = uint(208)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. LEAGUES & SEASONS
@@ -72,8 +77,10 @@ func (h *PortalHandler) GetLeagues(c echo.Context) error {
 	var leagues []models.League
 	query := h.DB.Order("status DESC, active DESC, name ASC")
 
+	// The admin `status` flag is the sole gate for public visibility; the
+	// Sportmonks `active` column is informational only.
 	if c.QueryParam("active_only") == "true" {
-		query = query.Where("status = ? AND active = ?", true, true)
+		query = query.Where("status = ?", true)
 	}
 
 	if err := query.Find(&leagues).Error; err != nil {
@@ -419,25 +426,113 @@ type FixtureListItem struct {
 	Venue            *models.Venue         `json:"venue,omitempty"`
 }
 
-// GetSeasonFixtures returns fixtures for a season, with optional round_id filter.
+// FixtureStatusItem is one entry of the status filter offered for a season's
+// fixture list: the state itself plus how many fixtures the filter would show.
+type FixtureStatusItem struct {
+	StateID   uint   `json:"state_id"`
+	State     string `json:"state"`
+	Name      string `json:"name"`
+	ShortName string `json:"short_name"`
+	Count     int    `json:"count"`
+}
+
+// Sportmonks state short names, grouped by how their fixtures should be read.
+// Anything not listed here is treated as "other": shown as-is, oldest first.
+var (
+	finishedFixtureStates = map[string]bool{"FT": true, "AET": true, "FT_PEN": true}
+	upcomingFixtureStates = map[string]bool{"NS": true, "TBA": true}
+	liveFixtureStates     = map[string]bool{"LIVE": true, "INPLAY": true, "1H": true, "2H": true, "HT": true, "ET": true, "PEN_LIVE": true, "BREAK": true}
+)
+
+// statusGroupRank orders the status filter chips: live, then upcoming, then
+// finished, then everything else.
+func statusGroupRank(shortName string) int {
+	switch {
+	case liveFixtureStates[shortName]:
+		return 0
+	case upcomingFixtureStates[shortName]:
+		return 1
+	case finishedFixtureStates[shortName]:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// GetSeasonFixtures returns fixtures for a season, with optional round_id,
+// stage_id and status filters.
+//
+// The status filter also decides the reading order, because "which match is
+// interesting" differs per state: finished fixtures are listed newest first
+// (latest results), while not-yet-played ones are listed soonest first and drop
+// any kickoff already in the past — those are stale rows the scraper has not
+// caught up with, and they would otherwise bury the next real match.
 func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 	seasonID, err := strconv.Atoi(c.Param("season_id"))
 	if err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, "invalid season id")
 	}
 
-	query := h.DB.Where("season_id = ?", seasonID).
+	// starting_at is stored as a UTC "Y-m-d H:i:s" string, so a lexicographic
+	// comparison against the same format is a valid chronological one.
+	nowUTC := time.Now().UTC().Format("2006-01-02 15:04:05")
+
+	// Scope shared by the fixture list and the status counts.
+	scope := func() *gorm.DB {
+		q := h.DB.Model(&models.Fixture{}).Where("season_id = ?", seasonID)
+		if roundID := c.QueryParam("round_id"); roundID != "" {
+			q = q.Where("round_id = ?", roundID)
+		}
+		if stageID := c.QueryParam("stage_id"); stageID != "" {
+			q = q.Where("stage_id = ?", stageID)
+		}
+		return q
+	}
+
+	availableStatuses, err := h.seasonFixtureStatuses(scope(), nowUTC)
+	if err != nil {
+		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+	}
+
+	// Only honour a status that is a real state; anything else (a typo, a
+	// hand-edited URL) falls back to the unfiltered list. A real state with no
+	// matching fixtures in this scope still filters — and returns nothing —
+	// rather than silently showing every fixture the caller did not ask for.
+	selectedStatus := strings.ToUpper(strings.TrimSpace(c.QueryParam("status")))
+	if selectedStatus != "" {
+		var known int64
+		if err := h.DB.Model(&models.State{}).
+			Where("UPPER(short_name) = ?", selectedStatus).
+			Count(&known).Error; err != nil {
+			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		}
+		if known == 0 {
+			selectedStatus = ""
+		}
+	}
+
+	query := scope().
 		Preload("State").
 		Preload("Scores").
 		Preload("Events").
-		Preload("Referees").
-		Order("starting_at ASC, id ASC")
+		Preload("Referees")
 
-	if roundID := c.QueryParam("round_id"); roundID != "" {
-		query = query.Where("round_id = ?", roundID)
-	}
-	if stageID := c.QueryParam("stage_id"); stageID != "" {
-		query = query.Where("stage_id = ?", stageID)
+	switch {
+	case selectedStatus == "":
+		query = query.Order("starting_at ASC, id ASC")
+	case finishedFixtureStates[selectedStatus]:
+		query = query.
+			Where("state_id IN (?)", h.stateIDsByShortName(selectedStatus)).
+			Order("starting_at DESC, id DESC")
+	case upcomingFixtureStates[selectedStatus]:
+		query = query.
+			Where("state_id IN (?)", h.stateIDsByShortName(selectedStatus)).
+			Where("starting_at >= ?", nowUTC).
+			Order("starting_at ASC, id ASC")
+	default:
+		query = query.
+			Where("state_id IN (?)", h.stateIDsByShortName(selectedStatus)).
+			Order("starting_at ASC, id ASC")
 	}
 
 	var fixtures []models.Fixture
@@ -448,7 +543,9 @@ func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 	// Cache teams for fast lookup
 	teamCache := make(map[uint]*models.Team)
 
-	var items []FixtureListItem
+	// Non-nil so an empty filter result serialises as [] rather than null —
+	// with the status filter, "no matches" is a normal outcome.
+	items := make([]FixtureListItem, 0, len(fixtures))
 	for _, f := range fixtures {
 		var v *models.Venue
 		if f.VenueID != nil && *f.VenueID > 0 {
@@ -534,9 +631,79 @@ func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 	}
 
 	return c.JSON(http.StatusOK, echo.Map{
-		"status": "success",
-		"data":   items,
+		"status":             "success",
+		"data":               items,
+		"available_statuses": availableStatuses,
+		"selected_status":    selectedStatus,
 	})
+}
+
+// stateIDsByShortName resolves a state short name (FT, NS, …) to the state ids
+// carrying it, as a subquery so it stays a single round trip.
+func (h *PortalHandler) stateIDsByShortName(shortName string) *gorm.DB {
+	return h.DB.Model(&models.State{}).
+		Select("id").
+		Where("UPPER(short_name) = ?", strings.ToUpper(shortName))
+}
+
+// seasonFixtureStatuses lists the states present in the given fixture scope,
+// each with the number of fixtures its filter would actually show — upcoming
+// states count only kickoffs still ahead, matching what the filter renders.
+func (h *PortalHandler) seasonFixtureStatuses(scope *gorm.DB, nowUTC string) ([]FixtureStatusItem, error) {
+	var rows []struct {
+		StateID    *uint
+		StartingAt *string
+	}
+	if err := scope.Select("state_id, starting_at").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+
+	var states []models.State
+	if err := h.DB.Find(&states).Error; err != nil {
+		return nil, err
+	}
+	stateByID := make(map[uint]models.State, len(states))
+	for _, st := range states {
+		stateByID[st.ID] = st
+	}
+
+	counts := make(map[uint]int)
+	for _, r := range rows {
+		if r.StateID == nil {
+			continue
+		}
+		st, ok := stateByID[*r.StateID]
+		if !ok {
+			continue
+		}
+		if upcomingFixtureStates[strings.ToUpper(st.ShortName)] {
+			if r.StartingAt == nil || *r.StartingAt < nowUTC {
+				continue
+			}
+		}
+		counts[*r.StateID]++
+	}
+
+	items := make([]FixtureStatusItem, 0, len(counts))
+	for id, n := range counts {
+		st := stateByID[id]
+		items = append(items, FixtureStatusItem{
+			StateID:   id,
+			State:     st.State,
+			Name:      st.Name,
+			ShortName: st.ShortName,
+			Count:     n,
+		})
+	}
+	sort.Slice(items, func(i, j int) bool {
+		ri, rj := statusGroupRank(strings.ToUpper(items[i].ShortName)), statusGroupRank(strings.ToUpper(items[j].ShortName))
+		if ri != rj {
+			return ri < rj
+		}
+		return items[i].ShortName < items[j].ShortName
+	})
+
+	return items, nil
 }
 
 // EnrichedEvent represents an event with player names, face photos, assist/sub detail, and home/away flag.
@@ -1588,8 +1755,16 @@ func (h *PortalHandler) GetSeasonTopscorers(c echo.Context) error {
 		}
 	}
 
+	// Default to the goals ranking when it exists — otherwise the lowest
+	// type id wins, which is usually a cards ranking (83/84) rather than goals.
 	if selectedTypeID == 0 && len(distinctTypeIDs) > 0 {
 		selectedTypeID = distinctTypeIDs[0]
+		for _, tid := range distinctTypeIDs {
+			if tid == goalTopscorerTypeID {
+				selectedTypeID = tid
+				break
+			}
+		}
 	}
 
 	// 2. Query topscorers for the selected type
