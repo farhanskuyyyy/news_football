@@ -909,6 +909,20 @@ func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 	// comparison against the same format is a valid chronological one.
 	nowUTC := time.Now().UTC().Format("2006-01-02 15:04:05")
 
+	// Optional club filter. Upcoming fixtures carry no score rows at all, so the
+	// participants are only recoverable from the fixture name ("Home vs Away"),
+	// which Sportmonks builds from the very team names we store.
+	selectedTeamID, _ := strconv.Atoi(c.QueryParam("team_id"))
+	var teamNamePattern string
+	if selectedTeamID > 0 {
+		var team models.Team
+		if err := h.DB.First(&team, selectedTeamID).Error; err != nil || team.Name == "" {
+			selectedTeamID = 0
+		} else {
+			teamNamePattern = team.Name
+		}
+	}
+
 	// Scope shared by the fixture list and the status counts.
 	scope := func() *gorm.DB {
 		q := h.DB.Model(&models.Fixture{}).Where("season_id = ?", seasonID)
@@ -917,6 +931,9 @@ func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 		}
 		if stageID := c.QueryParam("stage_id"); stageID != "" {
 			q = q.Where("stage_id = ?", stageID)
+		}
+		if selectedTeamID > 0 {
+			q = q.Where("name LIKE ? OR name LIKE ?", teamNamePattern+" vs %", "% vs "+teamNamePattern)
 		}
 		return q
 	}
@@ -1067,7 +1084,25 @@ func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 		"data":               items,
 		"available_statuses": availableStatuses,
 		"selected_status":    selectedStatus,
+		"available_teams":    h.seasonTeamOptions(uint(seasonID)),
+		"selected_team_id":   selectedTeamID,
 	})
+}
+
+// seasonTeamOptions lists the clubs registered for a season, for the fixture
+// list's club filter.
+func (h *PortalHandler) seasonTeamOptions(seasonID uint) []models.Team {
+	var teamIDs []uint
+	h.DB.Model(&models.SeasonTeam{}).Where("season_id = ?", seasonID).Pluck("team_id", &teamIDs)
+
+	teams := make([]models.Team, 0, len(teamIDs))
+	if len(teamIDs) == 0 {
+		return teams
+	}
+
+	h.DB.Where("id IN ?", teamIDs).Order("name ASC").Find(&teams)
+
+	return teams
 }
 
 // stateIDsByShortName resolves a state short name (FT, NS, …) to the state ids
@@ -1156,6 +1191,47 @@ type PeriodScoreItem struct {
 	AwayGoals   int    `json:"away_goals"`
 }
 
+// sortStartingXI orders a starting eleven by pitch position: row first, then
+// column, falling back to the formation slot when the coordinates are missing.
+func sortStartingXI(players []EnrichedLineupPlayer) {
+	sort.SliceStable(players, func(i, j int) bool {
+		a, b := players[i], players[j]
+		if a.Row != b.Row {
+			return a.Row < b.Row
+		}
+		if a.Col != b.Col {
+			return a.Col < b.Col
+		}
+		return formationSlot(a) < formationSlot(b)
+	})
+}
+
+// sortBench orders substitutes by shirt number, then name.
+func sortBench(players []EnrichedLineupPlayer) {
+	sort.SliceStable(players, func(i, j int) bool {
+		a, b := players[i], players[j]
+		an, bn := 1<<30, 1<<30
+		if a.JerseyNumber != nil {
+			an = *a.JerseyNumber
+		}
+		if b.JerseyNumber != nil {
+			bn = *b.JerseyNumber
+		}
+		if an != bn {
+			return an < bn
+		}
+		return a.PlayerName < b.PlayerName
+	})
+}
+
+// formationSlot is the lineup's position index, or a large value when unset.
+func formationSlot(p EnrichedLineupPlayer) int {
+	if p.FormationPosition != nil {
+		return *p.FormationPosition
+	}
+	return 1 << 30
+}
+
 // EnrichedStatisticItem represents a side-by-side metric comparison.
 type EnrichedStatisticItem struct {
 	TypeID    uint    `json:"type_id"`
@@ -1175,20 +1251,24 @@ type PlayerInMatchStat struct {
 
 // EnrichedLineupPlayer represents a player in the lineup with photo, field row/col, captain flag, and in-match statistics.
 type EnrichedLineupPlayer struct {
-	ID                uint                `json:"id"`
-	PlayerID          uint                `json:"player_id"`
-	TeamID            uint                `json:"team_id"`
-	PlayerName        string              `json:"player_name"`
-	PlayerImage       string              `json:"player_image"`
-	JerseyNumber      *int                `json:"jersey_number"`
-	PositionID        *uint               `json:"position_id"`
-	PositionName      string              `json:"position_name"`
-	FormationField    string              `json:"formation_field"`
-	FormationPosition *int                `json:"formation_position"`
-	Row               int                 `json:"row"`
-	Col               int                 `json:"col"`
-	Rating            *float64            `json:"rating,omitempty"`
-	Stats             []PlayerInMatchStat `json:"stats"`
+	ID           uint   `json:"id"`
+	PlayerID     uint   `json:"player_id"`
+	TeamID       uint   `json:"team_id"`
+	PlayerName   string `json:"player_name"`
+	PlayerImage  string `json:"player_image"`
+	JerseyNumber *int   `json:"jersey_number"`
+	PositionID   *uint  `json:"position_id"`
+	PositionName string `json:"position_name"`
+	// DetailedPositionName is the specific role ("Left Back") where Sportmonks
+	// supplied one; PositionName stays the coarse GK/DF/MF/FW bucket.
+	DetailedPositionID   *uint               `json:"detailed_position_id"`
+	DetailedPositionName string              `json:"detailed_position_name"`
+	FormationField       string              `json:"formation_field"`
+	FormationPosition    *int                `json:"formation_position"`
+	Row                  int                 `json:"row"`
+	Col                  int                 `json:"col"`
+	Rating               *float64            `json:"rating,omitempty"`
+	Stats                []PlayerInMatchStat `json:"stats"`
 }
 
 // TeamLineupSection groups starting XI and bench for a team with its formation.
@@ -1499,15 +1579,16 @@ func (h *PortalHandler) GetFixtureDetail(c echo.Context) error {
 
 	for _, lu := range fixture.Lineups {
 		elp := EnrichedLineupPlayer{
-			ID:                lu.ID,
-			PlayerID:          lu.PlayerID,
-			TeamID:            lu.TeamID,
-			PlayerName:        lu.PlayerName,
-			JerseyNumber:      lu.JerseyNumber,
-			PositionID:        lu.PositionID,
-			FormationField:    lu.FormationField,
-			FormationPosition: lu.FormationPosition,
-			Stats:             []PlayerInMatchStat{},
+			ID:                 lu.ID,
+			PlayerID:           lu.PlayerID,
+			TeamID:             lu.TeamID,
+			PlayerName:         lu.PlayerName,
+			JerseyNumber:       lu.JerseyNumber,
+			PositionID:         lu.PositionID,
+			FormationField:     lu.FormationField,
+			FormationPosition:  lu.FormationPosition,
+			DetailedPositionID: lu.DetailedPositionID,
+			Stats:              []PlayerInMatchStat{},
 		}
 
 		// Parse field coordinates e.g. "1:1" -> Row: 1, Col: 1
@@ -1531,6 +1612,14 @@ func (h *PortalHandler) GetFixtureDetail(c echo.Context) error {
 					}
 				}
 				elp.PlayerImage = p.ImagePath
+			}
+		}
+
+		// Detailed position ("Left Back") when the scrape captured one.
+		if lu.DetailedPositionID != nil && *lu.DetailedPositionID > 0 {
+			var dp models.Type
+			if err := h.DB.First(&dp, *lu.DetailedPositionID).Error; err == nil {
+				elp.DetailedPositionName = dp.Name
 			}
 		}
 
@@ -1596,6 +1685,15 @@ func (h *PortalHandler) GetFixtureDetail(c echo.Context) error {
 			}
 		}
 	}
+	// The XI is rendered as a pitch, so it has to come out in field order:
+	// by row, then left-to-right within the row. Without this the players land
+	// in whatever order the rows came back from the database, which is why a
+	// left back could be drawn in the middle of the defence.
+	sortStartingXI(homeSection.StartingXI)
+	sortStartingXI(awaySection.StartingXI)
+	sortBench(homeSection.Bench)
+	sortBench(awaySection.Bench)
+
 	homeSection.Formation = deriveFormation(homeSection.StartingXI)
 	awaySection.Formation = deriveFormation(awaySection.StartingXI)
 

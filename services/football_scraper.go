@@ -867,6 +867,86 @@ type LineupWithDetailsPayload struct {
 	Details       []models.FixtureLineupDetail `json:"details"`
 	LineupDetails []models.FixtureLineupDetail `json:"lineup_details"`
 	LineupDetail  []models.FixtureLineupDetail `json:"lineupDetail"`
+
+	// The flat detailed_position_id comes back null on every lineup row; the
+	// real value only arrives through the `lineups.detailedPosition` include.
+	DetailedPosition *struct {
+		ID uint `json:"id"`
+	} `json:"detailedposition"`
+}
+
+// resolved returns the lineup row with its detailed position filled in from the
+// include when the flat field was null, and the fixture id applied.
+func (l LineupWithDetailsPayload) resolved(fixtureID uint) models.FixtureLineup {
+	row := l.FixtureLineup
+	row.FixtureID = fixtureID
+
+	if row.DetailedPositionID == nil && l.DetailedPosition != nil && l.DetailedPosition.ID > 0 {
+		id := l.DetailedPosition.ID
+		row.DetailedPositionID = &id
+	}
+
+	return row
+}
+
+// replaceFixtureLineups writes a fresh lineup snapshot for the fixtures covered
+// by the batch.
+//
+// Upserting on the Sportmonks lineup id is not enough: when a lineup is revised
+// (a provisional XI becoming the confirmed one, a player moving from bench to
+// start) Sportmonks issues NEW row ids, so both snapshots survive and the same
+// player appears twice. Replacing per fixture keeps exactly one.
+//
+// Details are only cleared for fixtures that actually have replacements — the
+// list endpoint often returns lineups without nested details, and those details
+// are backfilled by a separate pass we must not wipe.
+func (s *FootballScraper) replaceFixtureLineups(lineups []models.FixtureLineup, details []models.FixtureLineupDetail) error {
+	if len(lineups) > 0 {
+		fixtureIDs := distinctFixtureIDs(func(yield func(uint)) {
+			for _, l := range lineups {
+				yield(l.FixtureID)
+			}
+		})
+		if len(fixtureIDs) > 0 {
+			if err := s.DB.Where("fixture_id IN ?", fixtureIDs).Delete(&models.FixtureLineup{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := s.DB.CreateInBatches(&lineups, dbBatchSize).Error; err != nil {
+			return err
+		}
+	}
+
+	if len(details) > 0 {
+		fixtureIDs := distinctFixtureIDs(func(yield func(uint)) {
+			for _, d := range details {
+				yield(d.FixtureID)
+			}
+		})
+		if len(fixtureIDs) > 0 {
+			if err := s.DB.Where("fixture_id IN ?", fixtureIDs).Delete(&models.FixtureLineupDetail{}).Error; err != nil {
+				return err
+			}
+		}
+		if err := s.DB.CreateInBatches(&details, dbBatchSize).Error; err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// distinctFixtureIDs collects the non-zero fixture ids produced by seq.
+func distinctFixtureIDs(seq func(yield func(uint))) []uint {
+	seen := map[uint]bool{}
+	var ids []uint
+	seq(func(id uint) {
+		if id > 0 && !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	})
+	return ids
 }
 
 // FixturePayload decodes a fixture along with its nested includes.
@@ -908,7 +988,7 @@ func (s *FootballScraper) ScrapeFixtures(ctx context.Context, activeLeagueIDs ma
 	}
 
 	extraParams := map[string]string{
-		"include": "events;lineups.details;scores;statistics;referees;participants",
+		"include": "events;lineups.details;lineups.detailedPosition;scores;statistics;referees;participants",
 		"filters": "fixtureSeasons:" + strings.Join(seasonIDStrs, ","),
 	}
 
@@ -937,8 +1017,7 @@ func (s *FootballScraper) ScrapeFixtures(ctx context.Context, activeLeagueIDs ma
 				events = append(events, ev)
 			}
 			for _, lu := range item.Lineups {
-				lModel := lu.FixtureLineup
-				lModel.FixtureID = item.ID
+				lModel := lu.resolved(item.ID)
 				lineups = append(lineups, lModel)
 
 				allDetails := append(lu.Details, lu.LineupDetails...)
@@ -993,14 +1072,12 @@ func (s *FootballScraper) ScrapeFixtures(ctx context.Context, activeLeagueIDs ma
 		if len(events) > 0 {
 			_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&events, dbBatchSize)
 		}
-		if len(lineups) > 0 {
-			_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&lineups, dbBatchSize)
-		}
-		if len(lineupDetails) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&lineupDetails, dbBatchSize).Error; err != nil {
-				log.Printf("[FootballScraper] Error saving %d lineup_details: %v", len(lineupDetails), err)
+		if len(lineups) > 0 || len(lineupDetails) > 0 {
+			if err := s.replaceFixtureLineups(lineups, lineupDetails); err != nil {
+				log.Printf("[FootballScraper] Error saving %d lineups / %d lineup_details: %v", len(lineups), len(lineupDetails), err)
 			}
-		} else if len(lineups) > 0 {
+		}
+		if len(lineupDetails) == 0 && len(lineups) > 0 {
 			// Lineups present but the list endpoint returned no nested details —
 			// they will be backfilled per-fixture by ScrapeFixtureLineupDetails.
 			log.Printf("[FootballScraper] %d lineups parsed but 0 lineup_details from list endpoint (will backfill per-fixture)", len(lineups))
@@ -1050,7 +1127,7 @@ func (s *FootballScraper) ScrapeFixtureLineupDetails(ctx context.Context, curren
 			return total, err
 		}
 		raw, err := s.Client.Get(fmt.Sprintf("football/fixtures/%d", fid), map[string]string{
-			"include": "lineups.details.type",
+			"include": "lineups.details.type;lineups.detailedPosition",
 		})
 		if err != nil {
 			log.Printf("[FootballScraper] Notice: lineup-detail backfill fixture %d: %v", fid, err)
@@ -1079,7 +1156,9 @@ func (s *FootballScraper) ScrapeFixtureLineupDetails(ctx context.Context, curren
 			}
 		}
 		if len(details) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&details, dbBatchSize).Error; err != nil {
+			// Replace rather than upsert: Sportmonks reissues detail ids along
+			// with the lineup rows they hang off, so upserting stacks snapshots.
+			if err := s.replaceFixtureLineups(nil, details); err != nil {
 				log.Printf("[FootballScraper] Error saving lineup details for fixture %d: %v", fid, err)
 			} else {
 				total += len(details)
@@ -1118,7 +1197,7 @@ type SingleFixturePayload struct {
 // referees). Used when a fixture page is opened but the fixture isn't in the DB.
 func (s *FootballScraper) ScrapeSingleFixture(fixtureID uint) error {
 	raw, err := s.Client.Get(fmt.Sprintf("football/fixtures/%d", fixtureID), map[string]string{
-		"include": "participants;league;season;venue;state;scores;events;lineups.details.type;statistics;referees",
+		"include": "participants;league;season;venue;state;scores;events;lineups.details.type;lineups.detailedPosition;statistics;referees",
 	})
 	if err != nil {
 		return fmt.Errorf("fetch fixture %d: %w", fixtureID, err)
@@ -1164,8 +1243,7 @@ func (s *FootballScraper) ScrapeSingleFixture(fixtureID uint) error {
 	var lineups []models.FixtureLineup
 	var lineupDetails []models.FixtureLineupDetail
 	for _, lu := range item.Lineups {
-		lModel := lu.FixtureLineup
-		lModel.FixtureID = item.ID
+		lModel := lu.resolved(item.ID)
 		lineups = append(lineups, lModel)
 		allDetails := append(lu.Details, lu.LineupDetails...)
 		allDetails = append(allDetails, lu.LineupDetail...)
@@ -1202,11 +1280,10 @@ func (s *FootballScraper) ScrapeSingleFixture(fixtureID uint) error {
 	if len(events) > 0 {
 		_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&events, dbBatchSize)
 	}
-	if len(lineups) > 0 {
-		_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&lineups, dbBatchSize)
-	}
-	if len(lineupDetails) > 0 {
-		_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&lineupDetails, dbBatchSize)
+	if len(lineups) > 0 || len(lineupDetails) > 0 {
+		if err := s.replaceFixtureLineups(lineups, lineupDetails); err != nil {
+			log.Printf("[FootballScraper] Error saving lineups fixture %d: %v", item.ID, err)
+		}
 	}
 	if len(scores) > 0 {
 		_ = s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&scores, dbBatchSize)
@@ -1291,7 +1368,7 @@ func (s *FootballScraper) ScrapeFixtureDetails(ctx context.Context, limit int, f
 			return result, err
 		}
 		raw, err := s.Client.Get(fmt.Sprintf("football/fixtures/%d", fid), map[string]string{
-			"include": "events;lineups.details.type;statistics;scores;participants;referees",
+			"include": "events;lineups.details.type;lineups.detailedPosition;statistics;scores;participants;referees",
 		})
 		if err != nil {
 			log.Printf("[FootballScraper] Notice: fixture detail %d: %v", fid, err)
@@ -1321,8 +1398,7 @@ func (s *FootballScraper) ScrapeFixtureDetails(ctx context.Context, limit int, f
 			events = append(events, ev)
 		}
 		for _, lu := range item.Lineups {
-			lModel := lu.FixtureLineup
-			lModel.FixtureID = item.ID
+			lModel := lu.resolved(item.ID)
 			lineups = append(lineups, lModel)
 
 			allDetails := append(lu.Details, lu.LineupDetails...)
@@ -1352,16 +1428,12 @@ func (s *FootballScraper) ScrapeFixtureDetails(ctx context.Context, limit int, f
 				log.Printf("[FootballScraper] Error saving events fixture %d: %v", fid, err)
 			}
 		}
-		if len(lineups) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&lineups, dbBatchSize).Error; err == nil {
+		if len(lineups) > 0 || len(lineupDetails) > 0 {
+			if err := s.replaceFixtureLineups(lineups, lineupDetails); err == nil {
 				result.Lineups += len(lineups)
-			}
-		}
-		if len(lineupDetails) > 0 {
-			if err := s.DB.Clauses(clause.OnConflict{UpdateAll: true}).CreateInBatches(&lineupDetails, dbBatchSize).Error; err == nil {
 				result.LineupDetails += len(lineupDetails)
 			} else {
-				log.Printf("[FootballScraper] Error saving lineup details fixture %d: %v", fid, err)
+				log.Printf("[FootballScraper] Error saving lineups fixture %d: %v", fid, err)
 			}
 		}
 		if len(scores) > 0 {
