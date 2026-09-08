@@ -855,13 +855,39 @@ type FixtureListItem struct {
 }
 
 // FixtureStatusItem is one entry of the status filter offered for a season's
-// fixture list: the state itself plus how many fixtures the filter would show.
+// fixture list. Entries are GROUPS, not individual states: a match finished at
+// full time, after extra time or on penalties is all just "finished" to a
+// reader, so those three states share one chip.
 type FixtureStatusItem struct {
-	StateID   uint   `json:"state_id"`
-	State     string `json:"state"`
-	Name      string `json:"name"`
-	ShortName string `json:"short_name"`
-	Count     int    `json:"count"`
+	Key   string `json:"key"`
+	Name  string `json:"name"`
+	Count int    `json:"count"`
+	// ShortNames are the state codes the group covers, for callers that need them.
+	ShortNames []string `json:"short_names"`
+}
+
+// Status group keys used by the ?status= filter.
+const (
+	statusGroupFinished = "finished"
+	statusGroupUpcoming = "upcoming"
+	statusGroupLive     = "live"
+)
+
+// statusGroupOf maps a state short name to the group its chip belongs to.
+// States outside the three known groups keep their own code as the key, so a
+// postponed or cancelled match still gets a chip of its own.
+func statusGroupOf(shortName string) string {
+	up := strings.ToUpper(shortName)
+	switch {
+	case finishedFixtureStates[up]:
+		return statusGroupFinished
+	case upcomingFixtureStates[up]:
+		return statusGroupUpcoming
+	case liveFixtureStates[up]:
+		return statusGroupLive
+	default:
+		return up
+	}
 }
 
 // Sportmonks state short names, grouped by how their fixtures should be read.
@@ -878,13 +904,13 @@ var (
 
 // statusGroupRank orders the status filter chips: live, then upcoming, then
 // finished, then everything else.
-func statusGroupRank(shortName string) int {
-	switch {
-	case liveFixtureStates[shortName]:
+func statusGroupRank(key string) int {
+	switch key {
+	case statusGroupLive:
 		return 0
-	case upcomingFixtureStates[shortName]:
+	case statusGroupUpcoming:
 		return 1
-	case finishedFixtureStates[shortName]:
+	case statusGroupFinished:
 		return 2
 	default:
 		return 3
@@ -943,19 +969,19 @@ func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 		return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
 	}
 
-	// Only honour a status that is a real state; anything else (a typo, a
-	// hand-edited URL) falls back to the unfiltered list. A real state with no
-	// matching fixtures in this scope still filters — and returns nothing —
-	// rather than silently showing every fixture the caller did not ask for.
-	selectedStatus := strings.ToUpper(strings.TrimSpace(c.QueryParam("status")))
+	// Only honour a status the season actually offers; a typo or a hand-edited
+	// URL falls back to the unfiltered list. Group keys ("finished") and raw
+	// state codes ("FT") are both accepted, so old links keep working.
+	selectedStatus := normaliseStatusKey(c.QueryParam("status"))
 	if selectedStatus != "" {
-		var known int64
-		if err := h.DB.Model(&models.State{}).
-			Where("UPPER(short_name) = ?", selectedStatus).
-			Count(&known).Error; err != nil {
-			return echo.NewHTTPError(http.StatusInternalServerError, err.Error())
+		known := false
+		for _, st := range availableStatuses {
+			if st.Key == selectedStatus {
+				known = true
+				break
+			}
 		}
-		if known == 0 {
+		if !known {
 			selectedStatus = ""
 		}
 	}
@@ -966,23 +992,31 @@ func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 		Preload("Events").
 		Preload("Referees")
 
-	switch {
-	case selectedStatus == "":
-		query = query.Order("starting_at ASC, id ASC")
-	case finishedFixtureStates[selectedStatus]:
-		query = query.
-			Where("state_id IN (?)", h.stateIDsByShortName(selectedStatus)).
-			Order("starting_at DESC, id DESC")
-	case upcomingFixtureStates[selectedStatus]:
-		query = query.
-			Where("state_id IN (?)", h.stateIDsByShortName(selectedStatus)).
-			Where("starting_at >= ?", nowUTC).
-			Order("starting_at ASC, id ASC")
-	default:
-		query = query.
-			Where("state_id IN (?)", h.stateIDsByShortName(selectedStatus)).
-			Order("starting_at ASC, id ASC")
+	// The status implies a natural reading order — finished results newest
+	// first, everything else soonest first — but an explicit ?sort wins.
+	sortDir := "asc"
+	if selectedStatus == statusGroupFinished {
+		sortDir = "desc"
 	}
+	switch strings.ToLower(strings.TrimSpace(c.QueryParam("sort"))) {
+	case "asc":
+		sortDir = "asc"
+	case "desc":
+		sortDir = "desc"
+	}
+
+	order := "starting_at ASC, id ASC"
+	if sortDir == "desc" {
+		order = "starting_at DESC, id DESC"
+	}
+
+	if selectedStatus != "" {
+		query = query.Where("state_id IN (?)", h.stateIDsForStatusGroup(selectedStatus))
+		if selectedStatus == statusGroupUpcoming {
+			query = query.Where("starting_at >= ?", nowUTC)
+		}
+	}
+	query = query.Order(order)
 
 	var fixtures []models.Fixture
 	if err := query.Find(&fixtures).Error; err != nil {
@@ -1086,6 +1120,7 @@ func (h *PortalHandler) GetSeasonFixtures(c echo.Context) error {
 		"selected_status":    selectedStatus,
 		"available_teams":    h.seasonTeamOptions(uint(seasonID)),
 		"selected_team_id":   selectedTeamID,
+		"sort":               sortDir,
 	})
 }
 
@@ -1105,12 +1140,50 @@ func (h *PortalHandler) seasonTeamOptions(seasonID uint) []models.Team {
 	return teams
 }
 
-// stateIDsByShortName resolves a state short name (FT, NS, …) to the state ids
-// carrying it, as a subquery so it stays a single round trip.
-func (h *PortalHandler) stateIDsByShortName(shortName string) *gorm.DB {
+// normaliseStatusKey accepts either a group key ("finished") or a raw state
+// code ("FT", "AET") and returns the group key to filter on.
+func normaliseStatusKey(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return ""
+	}
+
+	switch strings.ToLower(trimmed) {
+	case statusGroupFinished, statusGroupUpcoming, statusGroupLive:
+		return strings.ToLower(trimmed)
+	}
+
+	return statusGroupOf(trimmed)
+}
+
+// stateIDsForStatusGroup resolves a status group to the state ids it covers, as
+// a subquery so it stays a single round trip.
+func (h *PortalHandler) stateIDsForStatusGroup(key string) *gorm.DB {
+	var names []string
+	switch key {
+	case statusGroupFinished:
+		names = mapKeys(finishedFixtureStates)
+	case statusGroupUpcoming:
+		names = mapKeys(upcomingFixtureStates)
+	case statusGroupLive:
+		names = mapKeys(liveFixtureStates)
+	default:
+		names = []string{key}
+	}
+
 	return h.DB.Model(&models.State{}).
 		Select("id").
-		Where("UPPER(short_name) = ?", strings.ToUpper(shortName))
+		Where("UPPER(short_name) IN ?", names)
+}
+
+// mapKeys returns a set's keys, which are already upper-cased state codes.
+func mapKeys(set map[string]bool) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // seasonFixtureStatuses lists the states present in the given fixture scope,
@@ -1134,7 +1207,8 @@ func (h *PortalHandler) seasonFixtureStatuses(scope *gorm.DB, nowUTC string) ([]
 		stateByID[st.ID] = st
 	}
 
-	counts := make(map[uint]int)
+	counts := make(map[string]int)
+	names := make(map[string]map[string]bool)
 	for _, r := range rows {
 		if r.StateID == nil {
 			continue
@@ -1143,31 +1217,52 @@ func (h *PortalHandler) seasonFixtureStatuses(scope *gorm.DB, nowUTC string) ([]
 		if !ok {
 			continue
 		}
-		if upcomingFixtureStates[strings.ToUpper(st.ShortName)] {
+		key := statusGroupOf(st.ShortName)
+		if key == statusGroupUpcoming {
 			if r.StartingAt == nil || *r.StartingAt < nowUTC {
 				continue
 			}
 		}
-		counts[*r.StateID]++
+		counts[key]++
+		if names[key] == nil {
+			names[key] = map[string]bool{}
+		}
+		names[key][st.ShortName] = true
 	}
 
 	items := make([]FixtureStatusItem, 0, len(counts))
-	for id, n := range counts {
-		st := stateByID[id]
+	for key, n := range counts {
+		covered := make([]string, 0, len(names[key]))
+		for sn := range names[key] {
+			covered = append(covered, sn)
+		}
+		sort.Strings(covered)
+
+		// Ungrouped states keep the state's own name; the three known groups are
+		// labelled by the client so the wording can be translated.
+		label := key
+		if len(covered) == 1 && statusGroupRank(key) == 3 {
+			for _, st := range stateByID {
+				if st.ShortName == covered[0] {
+					label = st.Name
+					break
+				}
+			}
+		}
+
 		items = append(items, FixtureStatusItem{
-			StateID:   id,
-			State:     st.State,
-			Name:      st.Name,
-			ShortName: st.ShortName,
-			Count:     n,
+			Key:        key,
+			Name:       label,
+			Count:      n,
+			ShortNames: covered,
 		})
 	}
 	sort.Slice(items, func(i, j int) bool {
-		ri, rj := statusGroupRank(strings.ToUpper(items[i].ShortName)), statusGroupRank(strings.ToUpper(items[j].ShortName))
+		ri, rj := statusGroupRank(items[i].Key), statusGroupRank(items[j].Key)
 		if ri != rj {
 			return ri < rj
 		}
-		return items[i].ShortName < items[j].ShortName
+		return items[i].Key < items[j].Key
 	})
 
 	return items, nil
@@ -1261,14 +1356,17 @@ type EnrichedLineupPlayer struct {
 	PositionName string `json:"position_name"`
 	// DetailedPositionName is the specific role ("Left Back") where Sportmonks
 	// supplied one; PositionName stays the coarse GK/DF/MF/FW bucket.
-	DetailedPositionID   *uint               `json:"detailed_position_id"`
-	DetailedPositionName string              `json:"detailed_position_name"`
-	FormationField       string              `json:"formation_field"`
-	FormationPosition    *int                `json:"formation_position"`
-	Row                  int                 `json:"row"`
-	Col                  int                 `json:"col"`
-	Rating               *float64            `json:"rating,omitempty"`
-	Stats                []PlayerInMatchStat `json:"stats"`
+	DetailedPositionID   *uint  `json:"detailed_position_id"`
+	DetailedPositionName string `json:"detailed_position_name"`
+	// Nationality, for the flag shown beside the player's name.
+	CountryName       string              `json:"country_name"`
+	CountryFlag       string              `json:"country_flag"`
+	FormationField    string              `json:"formation_field"`
+	FormationPosition *int                `json:"formation_position"`
+	Row               int                 `json:"row"`
+	Col               int                 `json:"col"`
+	Rating            *float64            `json:"rating,omitempty"`
+	Stats             []PlayerInMatchStat `json:"stats"`
 }
 
 // TeamLineupSection groups starting XI and bench for a team with its formation.
@@ -1410,6 +1508,23 @@ func (h *PortalHandler) GetFixtureDetail(c echo.Context) error {
 	h.DB.Find(&allTypes)
 	for _, t := range allTypes {
 		typeMap[t.ID] = t.Name
+	}
+
+	countryCache := map[uint]*models.Country{}
+	getCountry := func(id *uint) *models.Country {
+		if id == nil || *id == 0 {
+			return nil
+		}
+		if c, ok := countryCache[*id]; ok {
+			return c
+		}
+		var c models.Country
+		if err := h.DB.First(&c, *id).Error; err != nil {
+			countryCache[*id] = nil
+			return nil
+		}
+		countryCache[*id] = &c
+		return &c
 	}
 
 	getPlayer := func(pid uint) *models.Player {
@@ -1602,7 +1717,7 @@ func (h *PortalHandler) GetFixtureDetail(c echo.Context) error {
 			}
 		}
 
-		// Lookup Player Photo & Display Name
+		// Lookup Player Photo, Display Name & nationality
 		if lu.PlayerID > 0 {
 			if p := getPlayer(lu.PlayerID); p != nil {
 				if elp.PlayerName == "" {
@@ -1612,6 +1727,17 @@ func (h *PortalHandler) GetFixtureDetail(c echo.Context) error {
 					}
 				}
 				elp.PlayerImage = p.ImagePath
+
+				// Nationality is who the player represents; country of birth is
+				// the fallback when Sportmonks has not set one.
+				country := getCountry(p.NationalityID)
+				if country == nil {
+					country = getCountry(p.CountryID)
+				}
+				if country != nil {
+					elp.CountryName = country.Name
+					elp.CountryFlag = country.ImagePath
+				}
 			}
 		}
 
