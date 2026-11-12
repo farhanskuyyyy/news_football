@@ -1,0 +1,6 @@
+services:
+  app:
+    ports: !override
+      - "127.0.0.1:8082:8080"
+  postgres:
+    ports: !override []
