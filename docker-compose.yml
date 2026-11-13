@@ -8,7 +8,7 @@ services:
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: postgres
-      DB_PASS: postgres
+      DB_PASS: ${DB_PASS:?set di .env}
       DB_NAME: newsdb
       REDIS_ADDR: redis:6379
       NEWS_API_URL: ${NEWS_API_URL:-https://newsapi.org/v2/everything?q=European%20football&language=en&sortBy=publishedAt}
@@ -25,9 +25,10 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set di .env}
       POSTGRES_DB: newsdb
     ports:
       - "5434:5432"
@@ -41,6 +42,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     volumes:
       - redisdata:/data
     healthcheck:
@@ -56,8 +58,8 @@ services:
       - "5672:5672"
       - "15672:15672"
     environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS:?set di .env}
     volumes:
       - rabbitmqdata:/var/lib/rabbitmq
     healthcheck:
@@ -74,7 +76,7 @@ services:
       - "3001:3000"
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?set di .env}
     volumes:
       - grafanadata:/var/lib/grafana
     restart: unless-stopped
